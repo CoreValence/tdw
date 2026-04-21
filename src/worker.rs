@@ -5,12 +5,13 @@ use std::net::ToSocketAddrs;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::guc::{BATCH_MAX, BATCH_WAIT_MS, TB_ADDR, TB_CLUSTER_ID};
 use crate::pack::{pack_account, pack_balance, pack_transfer};
 use crate::shmem::{
-    BATCH_WAIT_MS, CAPACITY, ERR_BUF_LEN, MAX_BATCH, MAX_QUERY_ROWS, OP_CREATE_ACCOUNT,
-    OP_CREATE_TRANSFER, OP_GET_ACCOUNT_BALANCES, OP_GET_ACCOUNT_TRANSFERS, OP_LOOKUP_ACCOUNT,
-    OP_LOOKUP_TRANSFER, OP_QUERY_ACCOUNTS, OP_QUERY_TRANSFERS, RECORD_LEN, RESULT_BUF_LEN, RING,
-    S_DONE, S_ERROR, S_IN_FLIGHT, S_PENDING, WORKER_LATCH,
+    CAPACITY, ERR_BUF_LEN, MAX_QUERY_ROWS, OP_CREATE_ACCOUNT, OP_CREATE_TRANSFER,
+    OP_GET_ACCOUNT_BALANCES, OP_GET_ACCOUNT_TRANSFERS, OP_LOOKUP_ACCOUNT, OP_LOOKUP_TRANSFER,
+    OP_QUERY_ACCOUNTS, OP_QUERY_TRANSFERS, RECORD_LEN, RESULT_BUF_LEN, RING, S_DONE, S_ERROR,
+    S_IN_FLIGHT, S_PENDING, WORKER_LATCH,
 };
 
 // pgrx's attach_signal_handlers gets clobbered because TB's Zig runtime sets
@@ -49,9 +50,12 @@ fn resolve_tb_addr(raw: &str) -> String {
             if e.parse::<std::net::SocketAddr>().is_ok() || e.parse::<u16>().is_ok() {
                 return e.to_string();
             }
-            match e.to_socket_addrs().ok().and_then(|mut it| it.next()) {
-                Some(sa) => sa.to_string(),
-                None => e.to_string(),
+            match e.to_socket_addrs() {
+                Ok(mut it) => match it.next() {
+                    Some(sa) => sa.to_string(),
+                    None => error!("beetle: could not resolve {:?}: no addresses returned", e),
+                },
+                Err(err) => error!("beetle: could not resolve {:?}: {}", e, err),
             }
         })
         .collect::<Vec<_>>()
@@ -86,7 +90,10 @@ fn outcome_id(id: u128) -> Outcome {
 }
 
 fn outcome_single(record: [u8; RECORD_LEN]) -> Outcome {
-    Outcome::Ok { count: 1, bytes: record.to_vec() }
+    Outcome::Ok {
+        count: 1,
+        bytes: record.to_vec(),
+    }
 }
 
 enum BatchErr {
@@ -101,12 +108,22 @@ pub extern "C-unwind" fn beetle_worker_main(_arg: pg_sys::Datum) {
         *WORKER_LATCH.exclusive() = pg_sys::MyLatch as usize;
     }
 
-    let tb_addr_raw = std::env::var("BEETLE_TB_ADDR").unwrap_or_else(|_| "3000".into());
+    let tb_addr_raw = TB_ADDR
+        .get()
+        .and_then(|s| s.into_string().ok())
+        .unwrap_or_default();
+    if tb_addr_raw.is_empty() {
+        error!("beetle: beetle.tb_addr must be set (e.g. 'host:port' or 'port')");
+    }
     let tb_addr = resolve_tb_addr(&tb_addr_raw);
-    let cluster_id: u128 = std::env::var("BEETLE_TB_CLUSTER_ID")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
+
+    let cluster_id_raw = TB_CLUSTER_ID
+        .get()
+        .and_then(|s| s.into_string().ok())
+        .unwrap_or_default();
+    let cluster_id: u128 = cluster_id_raw.parse().unwrap_or_else(|e| {
+        error!("beetle: invalid beetle.tb_cluster_id={:?}: {}", cluster_id_raw, e)
+    });
 
     log!(
         "beetle: connecting to TigerBeetle at {} (resolved from {}) cluster {}",
@@ -153,7 +170,7 @@ pub extern "C-unwind" fn beetle_worker_main(_arg: pg_sys::Datum) {
             continue;
         }
 
-        BackgroundWorker::wait_latch(Some(Duration::from_millis(BATCH_WAIT_MS)));
+        BackgroundWorker::wait_latch(Some(Duration::from_millis(BATCH_WAIT_MS.get() as u64)));
     }
 
     log!("beetle: worker exiting");
@@ -167,9 +184,10 @@ pub extern "C-unwind" fn beetle_worker_main(_arg: pg_sys::Datum) {
 
 fn drain_pending() -> Vec<Pending> {
     let mut out = Vec::new();
+    let max_batch = BATCH_MAX.get() as usize;
     let mut guard = RING.exclusive();
     for i in 0..CAPACITY {
-        if out.len() >= MAX_BATCH {
+        if out.len() >= max_batch {
             break;
         }
         let s = &mut guard.slots[i];
@@ -239,7 +257,13 @@ fn run_batch(
             })
             .collect();
         let res = rt.block_on(client.create_accounts(accounts));
-        apply_batch(&account_idx, pending, &mut outcomes, res, format_accounts_err);
+        apply_batch(
+            &account_idx,
+            pending,
+            &mut outcomes,
+            res,
+            format_accounts_err,
+        );
     }
 
     if !transfer_idx.is_empty() {
@@ -259,11 +283,20 @@ fn run_batch(
             })
             .collect();
         let res = rt.block_on(client.create_transfers(transfers));
-        apply_batch(&transfer_idx, pending, &mut outcomes, res, format_transfers_err);
+        apply_batch(
+            &transfer_idx,
+            pending,
+            &mut outcomes,
+            res,
+            format_transfers_err,
+        );
     }
 
     if !lookup_account_idx.is_empty() {
-        let ids: Vec<u128> = lookup_account_idx.iter().map(|&i| pending[i].debit_id).collect();
+        let ids: Vec<u128> = lookup_account_idx
+            .iter()
+            .map(|&i| pending[i].debit_id)
+            .collect();
         match rt.block_on(client.lookup_accounts(ids.clone())) {
             Ok(found) => {
                 let by_id: HashMap<u128, tigerbeetle_unofficial::Account> =
@@ -284,7 +317,10 @@ fn run_batch(
     }
 
     if !lookup_transfer_idx.is_empty() {
-        let ids: Vec<u128> = lookup_transfer_idx.iter().map(|&i| pending[i].debit_id).collect();
+        let ids: Vec<u128> = lookup_transfer_idx
+            .iter()
+            .map(|&i| pending[i].debit_id)
+            .collect();
         match rt.block_on(client.lookup_transfers(ids.clone())) {
             Ok(found) => {
                 let by_id: HashMap<u128, tigerbeetle_unofficial::Transfer> =
@@ -346,9 +382,8 @@ fn run_account_transfers(
 ) -> Outcome {
     let limit = p.limit.clamp(1, MAX_QUERY_ROWS);
     let filter = Box::new(
-        tigerbeetle_unofficial::account::Filter::new(p.debit_id, limit).with_flags(
-            tigerbeetle_unofficial::account::FilterFlags::from_bits_retain(p.flags),
-        ),
+        tigerbeetle_unofficial::account::Filter::new(p.debit_id, limit)
+            .with_flags(tigerbeetle_unofficial::account::FilterFlags::from_bits_retain(p.flags)),
     );
     match rt.block_on(client.get_account_transfers(filter)) {
         Ok(v) => {
@@ -366,9 +401,8 @@ fn run_account_balances(
 ) -> Outcome {
     let limit = p.limit.clamp(1, MAX_QUERY_ROWS);
     let filter = Box::new(
-        tigerbeetle_unofficial::account::Filter::new(p.debit_id, limit).with_flags(
-            tigerbeetle_unofficial::account::FilterFlags::from_bits_retain(p.flags),
-        ),
+        tigerbeetle_unofficial::account::Filter::new(p.debit_id, limit)
+            .with_flags(tigerbeetle_unofficial::account::FilterFlags::from_bits_retain(p.flags)),
     );
     match rt.block_on(client.get_account_balances(filter)) {
         Ok(v) => {
@@ -385,9 +419,8 @@ fn run_query_accounts(
     p: &Pending,
 ) -> Outcome {
     let limit = p.limit.clamp(1, MAX_QUERY_ROWS);
-    let mut filter = tigerbeetle_unofficial::QueryFilter::new(limit).with_flags(
-        tigerbeetle_unofficial::core::query_filter::Flags::from_bits_retain(p.flags),
-    );
+    let mut filter = tigerbeetle_unofficial::QueryFilter::new(limit)
+        .with_flags(tigerbeetle_unofficial::core::query_filter::Flags::from_bits_retain(p.flags));
     if p.ledger != 0 {
         filter.set_ledger(p.ledger);
     }
@@ -409,9 +442,8 @@ fn run_query_transfers(
     p: &Pending,
 ) -> Outcome {
     let limit = p.limit.clamp(1, MAX_QUERY_ROWS);
-    let mut filter = tigerbeetle_unofficial::QueryFilter::new(limit).with_flags(
-        tigerbeetle_unofficial::core::query_filter::Flags::from_bits_retain(p.flags),
-    );
+    let mut filter = tigerbeetle_unofficial::QueryFilter::new(limit)
+        .with_flags(tigerbeetle_unofficial::core::query_filter::Flags::from_bits_retain(p.flags));
     if p.ledger != 0 {
         filter.set_ledger(p.ledger);
     }

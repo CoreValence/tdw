@@ -6,8 +6,6 @@ use pgrx::{PGRXSharedMemory, PgLwLock};
 // this product at ~3 MB to leave headroom for pgrx/postgres frames.
 // Bursts above CAPACITY block on the session latch (see submit::submit_and_wait).
 pub(crate) const CAPACITY: usize = 1024;
-pub(crate) const MAX_BATCH: usize = 8189;
-pub(crate) const BATCH_WAIT_MS: u64 = 1;
 
 pub(crate) const S_EMPTY: u8 = 0;
 pub(crate) const S_PENDING: u8 = 1;
@@ -94,12 +92,14 @@ pub(crate) struct Ring {
 
 impl Ring {
     pub(crate) const fn empty() -> Self {
-        Ring { slots: [Slot::empty(); CAPACITY], cursor: 0 }
+        Ring {
+            slots: [Slot::empty(); CAPACITY],
+            cursor: 0,
+        }
     }
 }
 
 unsafe impl PGRXSharedMemory for Ring {}
 
 pub(crate) static RING: PgLwLock<Ring> = unsafe { PgLwLock::new(c"beetle_ring") };
-pub(crate) static WORKER_LATCH: PgLwLock<usize> =
-    unsafe { PgLwLock::new(c"beetle_worker_latch") };
+pub(crate) static WORKER_LATCH: PgLwLock<usize> = unsafe { PgLwLock::new(c"beetle_worker_latch") };

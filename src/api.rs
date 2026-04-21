@@ -1,8 +1,8 @@
 use pgrx::prelude::*;
 
 use crate::pack::{
-    unpack_account_row, unpack_balance_row, unpack_transfer_row, AccountRow, BalanceRow,
-    TransferRow,
+    AccountRow, BalanceRow, TransferRow, unpack_account_row, unpack_balance_row,
+    unpack_transfer_row,
 };
 use crate::shmem::{
     MAX_QUERY_ROWS, OP_CREATE_ACCOUNT, OP_CREATE_TRANSFER, OP_GET_ACCOUNT_BALANCES,
@@ -17,7 +17,10 @@ fn flags_from_i32(flags: i32, max_bits: u32) -> u32 {
     }
     let f = flags as u32;
     if f & !max_bits != 0 {
-        error!("flags 0x{:x} contains unsupported bits (allowed: 0x{:x})", f, max_bits);
+        error!(
+            "flags 0x{:x} contains unsupported bits (allowed: 0x{:x})",
+            f, max_bits
+        );
     }
     f
 }

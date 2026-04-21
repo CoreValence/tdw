@@ -1,7 +1,7 @@
 use pgrx::prelude::*;
 
 use crate::shmem::{
-    Slot, CAPACITY, RECORD_LEN, RESULT_BUF_LEN, RING, S_DONE, S_EMPTY, S_ERROR, S_PENDING,
+    CAPACITY, RECORD_LEN, RESULT_BUF_LEN, RING, S_DONE, S_EMPTY, S_ERROR, S_PENDING, Slot,
     WORKER_LATCH,
 };
 

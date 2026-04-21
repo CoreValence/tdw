@@ -44,14 +44,16 @@ services:
     environment:
       POSTGRES_DB: beetle
       POSTGRES_HOST_AUTH_METHOD: trust
-      BEETLE_TB_ADDR: tigerbeetle:3000
-      BEETLE_TB_CLUSTER_ID: "0"
     command:
       - postgres
       - -c
       - shared_preload_libraries=beetle
       - -c
       - max_connections=1024
+      - -c
+      - beetle.tb_addr=tigerbeetle:3000
+      - -c
+      - beetle.tb_cluster_id=0
     ports:
       - "28819:5432"
     healthcheck:

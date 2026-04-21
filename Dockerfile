@@ -48,5 +48,5 @@ COPY --from=builder /usr/lib/postgresql/18/lib/beetle.so \
                     /usr/lib/postgresql/18/lib/beetle.so
 COPY --from=builder /usr/share/postgresql/18/extension/beetle.control \
                     /usr/share/postgresql/18/extension/beetle.control
-COPY --from=builder /usr/share/postgresql/18/extension/beetle--0.0.0.sql \
-                    /usr/share/postgresql/18/extension/beetle--0.0.0.sql
+COPY --from=builder /usr/share/postgresql/18/extension/beetle--0.1.0.sql \
+                    /usr/share/postgresql/18/extension/beetle--0.1.0.sql
