@@ -1,0 +1,38 @@
+[package]
+name         = "beetle"
+version      = "0.1.0"
+edition      = "2024"
+rust-version = "1.95.0"
+description  = "beetle — a programmable ledger layer on TigerBeetle"
+repository   = "https://github.com/CoreValence/beetle"
+authors      = ["developers@corevalence.com"]
+publish      = false
+
+[lib]
+crate-type = ["cdylib"]
+doctest    = false
+
+[features]
+default = ["pg18"]
+pg13    = ["pgrx/pg13"]
+pg14    = ["pgrx/pg14"]
+pg15    = ["pgrx/pg15"]
+pg16    = ["pgrx/pg16"]
+pg17    = ["pgrx/pg17"]
+pg18    = ["pgrx/pg18"]
+
+[dependencies]
+libc                   = "0.2"
+pgrx                   = "=0.18.0"
+tigerbeetle-unofficial = "0.14"
+tokio                  = { features = ["rt", "sync", "time"], version = "1" }
+
+[profile.dev]
+panic = "unwind"
+
+[profile.release]
+codegen-units = 1
+lto           = "fat"
+opt-level     = 3
+panic         = "unwind"
+strip         = "debuginfo"
