@@ -2,9 +2,9 @@
 
 # beetle
 
-A programmable ledger layer on [TigerBeetle](https://tigerbeetle.com/), packaged as a [PostgreSQL extension](https://www.postgresql.org/docs/current/extend-extensions.html).
+A SQL interface to [TigerBeetle](https://tigerbeetle.com/), packaged as a [PostgreSQL extension](https://www.postgresql.org/docs/current/extend-extensions.html).
 
-`beetle` lets you post accounts, post transfers, and query balances/history from plain SQL — while TigerBeetle stays authoritative for the double-entry state. A background worker inside Postgres batches requests from regular backends into the TB client, so each connection only pays for a shared-memory enqueue instead of holding its own socket to the cluster.
+`beetle` lets you post accounts, post transfers, and query balances or history from plain SQL, while TigerBeetle stays authoritative for the double-entry state. A background worker inside Postgres batches requests from regular backends into the TB client, so each connection only pays for a shared-memory enqueue instead of holding its own socket to the cluster.
 
 ## Requirements
 
@@ -115,7 +115,7 @@ post_account(id uuid, ledger int, code int, flags int default 0) → void
 -- Post a transfer; returns the transfer id (same as the one generated server-side).
 post_transfer(debit uuid, credit uuid, amount numeric, ledger int, code int) → uuid
 
--- Lookups — return 0 rows if not found.
+-- Lookups. Return 0 rows if not found.
 lookup_account(id uuid)  → table(...)
 lookup_transfer(id uuid) → table(...)
 
