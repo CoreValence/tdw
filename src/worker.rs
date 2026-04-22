@@ -528,7 +528,7 @@ fn format_transfers_err(e: &tigerbeetle_unofficial::error::CreateTransfersError)
 fn publish_outcomes(pending: Vec<Pending>, outcomes: Vec<Outcome>) -> Vec<usize> {
     let mut latches = Vec::with_capacity(pending.len());
     let mut guard = RING.exclusive();
-    for (p, outcome) in pending.into_iter().zip(outcomes.into_iter()) {
+    for (p, outcome) in pending.into_iter().zip(outcomes) {
         let s = &mut guard.slots[p.slot_idx];
         match outcome {
             Outcome::Ok { count, bytes } => {

@@ -1,3 +1,5 @@
+#![allow(clippy::type_complexity)]
+
 use pgrx::prelude::*;
 
 use crate::pack::{
@@ -203,7 +205,7 @@ fn account_transfers(
     let rows: Vec<TransferRow> = (0..rb.count as usize)
         .filter_map(|i| rb.record(i).map(unpack_transfer_row))
         .collect();
-    pgrx::iter::TableIterator::new(rows.into_iter())
+    pgrx::iter::TableIterator::new(rows)
 }
 
 #[pg_extern]
@@ -238,7 +240,7 @@ fn account_balances(
     let rows: Vec<BalanceRow> = (0..rb.count as usize)
         .filter_map(|i| rb.record(i).map(unpack_balance_row))
         .collect();
-    pgrx::iter::TableIterator::new(rows.into_iter())
+    pgrx::iter::TableIterator::new(rows)
 }
 
 #[pg_extern]
@@ -276,7 +278,7 @@ fn query_accounts(
     let rows: Vec<AccountRow> = (0..rb.count as usize)
         .filter_map(|i| rb.record(i).map(unpack_account_row))
         .collect();
-    pgrx::iter::TableIterator::new(rows.into_iter())
+    pgrx::iter::TableIterator::new(rows)
 }
 
 #[pg_extern]
@@ -313,7 +315,7 @@ fn query_transfers(
     let rows: Vec<TransferRow> = (0..rb.count as usize)
         .filter_map(|i| rb.record(i).map(unpack_transfer_row))
         .collect();
-    pgrx::iter::TableIterator::new(rows.into_iter())
+    pgrx::iter::TableIterator::new(rows)
 }
 
 fn check_filter_args(limit: i32, flags: i32, max_flag_bits: u32) -> (u32, u32) {
