@@ -32,13 +32,13 @@ CLIENTS=128 DURATION=60 docker compose run --rm bench
 Each tagged release ships prebuilt bundles on the [Releases page](https://github.com/CoreValence/beetle/releases), one per Postgres major (15–18) and arch (amd64, arm64). Pick the file matching your setup:
 
 ```
-beetle-<version>-pg<major>-linux-<arch>.tar.gz
+beetle-pg<major>-linux-<arch>.tar.gz
 ```
 
 The tarball uses Debian's standard Postgres layout (`/usr/lib/postgresql/<major>/lib/` for the extension `.so`, `/usr/share/postgresql/<major>/extension/` for the `.control` and `.sql`). On Debian/Ubuntu with the PGDG packages, extract from the filesystem root:
 
 ```sh
-sudo tar xzf beetle-0.1.0-pg18-linux-amd64.tar.gz -C /
+sudo tar xzf beetle-pg18-linux-amd64.tar.gz -C /
 ```
 
 For a non-Debian install, check `pg_config --pkglibdir` and `pg_config --sharedir` and move the extracted files into those directories instead.
@@ -58,6 +58,38 @@ Restart Postgres, then per database:
 ```sql
 CREATE EXTENSION beetle;
 ```
+
+## Docker
+
+The release tarball drops into the stock `postgres:<major>-bookworm` layout unchanged, so a runnable image is a two-line `Dockerfile`:
+
+```dockerfile
+FROM postgres:18-bookworm
+ADD https://github.com/CoreValence/beetle/releases/download/v0.1.0/beetle-pg18-linux-amd64.tar.gz /tmp/beetle.tgz
+RUN tar xzf /tmp/beetle.tgz -C / && rm /tmp/beetle.tgz
+```
+
+Swap the Postgres major (`15`–`18`) and arch (`amd64`, `arm64`) in both the `FROM` and the tarball filename to match your target.
+
+Run it against an existing TigerBeetle cluster:
+
+```sh
+docker build -t beetle:pg18 .
+docker run --rm \
+  --security-opt seccomp=unconfined \
+  -e POSTGRES_HOST_AUTH_METHOD=trust \
+  -e POSTGRES_DB=beetle \
+  -p 5432:5432 \
+  beetle:pg18 \
+  postgres \
+    -c shared_preload_libraries=beetle \
+    -c beetle.tb_addr=10.0.0.10:3000,10.0.0.11:3000,10.0.0.12:3000 \
+    -c beetle.tb_cluster_id=1
+```
+
+`seccomp=unconfined` is required: TigerBeetle's Zig client uses `io_uring` for TCP, which Docker's default seccomp profile blocks.
+
+For a full multi-service setup (three TB replicas + Postgres built from source), see the bundled `compose.yml` and `Dockerfile` at the repo root — `docker compose up -d postgres` brings the whole stack up.
 
 ## Configuration
 

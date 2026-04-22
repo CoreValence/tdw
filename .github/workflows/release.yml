@@ -104,7 +104,7 @@ jobs:
           PG: ${{ matrix.pg }}
           ARCH: ${{ matrix.arch }}
         run: |
-          NAME="beetle-${VERSION}-pg${PG}-linux-${ARCH}"
+          NAME="beetle-pg${PG}-linux-${ARCH}"
           mkdir -p dist
           tar czf "dist/${NAME}.tar.gz" -C "target/release/beetle-pg${PG}" .
           (cd dist && sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256")
@@ -140,7 +140,7 @@ jobs:
 
       - uses: softprops/action-gh-release@v2
         with:
-          draft: true
           files: dist/*
           name: ${{ github.ref_name }}
           tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
