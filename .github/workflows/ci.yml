@@ -16,6 +16,8 @@ jobs:
       matrix:
         pg: [ 15, 16, 17, 18 ]
     runs-on: ubuntu-latest
+    env:
+      PGRX_PG_CONFIG_PATH: /usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
     steps:
       - uses: actions/checkout@v4
 
