@@ -115,13 +115,13 @@ DECLARE
     bob   uuid := gen_random_uuid();
     xfer  uuid;
 BEGIN
-    PERFORM post_account(alice, 1, 100);
-    PERFORM post_account(bob,   1, 100);
-    xfer := post_transfer(alice, bob, 1000, 1, 10);
+    PERFORM accounts.open(alice, 1, 100);
+    PERFORM accounts.open(bob,   1, 100);
+    xfer := transfers.post(gen_random_uuid(), alice, bob, 1000, 1, 10);
     RAISE NOTICE 'transfer %', xfer;
 END $$;
 
-SELECT debits_posted, credits_posted, ledger, code FROM lookup_account(alice);
+SELECT debits_posted, credits_posted, ledger, code FROM accounts.get(alice);
 --  debits_posted | credits_posted | ledger | code
 -- ---------------+----------------+--------+------
 --           1000 |              0 |      1 |  100
@@ -130,44 +130,93 @@ SELECT debits_posted, credits_posted, ledger, code FROM lookup_account(alice);
 Per-transfer balance snapshots (the TB `HISTORY` flag = 8 must be set at account creation):
 
 ```sql
-PERFORM post_account(alice, 1, 100, 8);
+PERFORM accounts.open(alice, 1, 100, 8);
 -- … post a few transfers against alice …
-SELECT timestamp, debits_posted, credits_posted FROM account_balances(alice) LIMIT 10;
+SELECT timestamp, debits_posted, credits_posted FROM accounts.history(alice) LIMIT 10;
 ```
 
 Account-scoped transfer history with a TB flag bitfield (`DEBITS = 1`, `CREDITS = 2`):
 
 ```sql
 -- outgoing transfers from alice only
-SELECT id, credit, amount FROM account_transfers(alice, 50, 1);
+SELECT id, credit, amount FROM accounts.ledger(alice, 50, 1);
 ```
 
 Global scan by ledger/code coordinate:
 
 ```sql
-SELECT id, debit, credit, amount FROM query_transfers(1, 10, 100);
+SELECT id, debit, credit, amount FROM transfers.search(1, 10, 100);
 ```
 
 ## SQL API
 
-```sql
--- Create an account. flags is the raw TB bitfield (HISTORY = 8, LINKED = 1, …).
-post_account(id uuid, ledger int, code int, flags int default 0) → void
+Client-provided ids are the idempotency primitive: re-posting a transfer with the same id returns the existing row rather than creating a duplicate (TB's `exists` error). Generate them with `gen_random_uuid()`.
 
--- Post a transfer; returns the transfer id (same as the one generated server-side).
-post_transfer(debit uuid, credit uuid, amount numeric, ledger int, code int) → uuid
+All functions live in one of two schemas: `accounts` or `transfers`.
+
+```sql
+-- ─── accounts ────────────────────────────────────────────────────────────
+-- Create an account. flags is the raw TB bitfield (HISTORY = 8, LINKED = 1, …).
+accounts.open(id uuid, ledger int, code int, flags int default 0) → uuid
 
 -- Lookups. Return 0 rows if not found.
-lookup_account(id uuid)  → table(...)
-lookup_transfer(id uuid) → table(...)
+accounts.get(id uuid) → table(...)
 
--- History scoped to an account.
-account_transfers(account_id uuid, limit int default 10, flags int default 0) → setof record
-account_balances (account_id uuid, limit int default 10)                      → setof record
+-- Account-scoped history. flags: DEBITS(1) | CREDITS(2) | REVERSED(4).
+accounts.ledger (account_id uuid, limit int default 10, flags int default 3) → setof record
+accounts.history(account_id uuid, limit int default 10, flags int default 3) → setof record
 
 -- Query-by-coordinate.
-query_accounts (ledger int default 0, code int default 0, limit int default 10) → setof record
-query_transfers(ledger int default 0, code int default 0, limit int default 10) → setof record
+accounts.search(ledger int default 0, code int default 0, limit int default 10, flags int default 0) → setof record
+
+-- ─── transfers ───────────────────────────────────────────────────────────
+-- Post a transfer. Returns the same id that was passed in.
+transfers.post(id uuid, debit uuid, credit uuid, amount bigint, ledger int, code int,
+               flags int default 0) → uuid
+
+-- Two-phase: reserve funds, then capture or release. amount NULL on capture
+-- captures the full held amount; a smaller amount captures a partial and
+-- auto-releases the rest.
+transfers.hold   (id uuid, debit uuid, credit uuid, amount bigint, ledger int, code int) → uuid
+transfers.capture(id uuid, pending_id uuid, amount bigint default NULL) → uuid
+transfers.release(id uuid, pending_id uuid) → uuid
+
+-- Sweep transfers: TB caps amount at the counterparty's available balance,
+-- so you can say "move up to this much" and TB does the math.
+transfers.sweep_from(id uuid, debit uuid, credit uuid, amount bigint, ledger int, code int) → uuid
+transfers.sweep_to  (id uuid, debit uuid, credit uuid, amount bigint, ledger int, code int) → uuid
+
+-- Atomic chain of transfers in a single TB call. Each leg is a JSON object:
+--   {"id":uuid, "debit":uuid, "credit":uuid, "amount":int, "ledger":int, "code":int,
+--    "pending_id"?:uuid, "flags"?:int}
+-- The LINKED flag is applied automatically so all legs commit or none do.
+transfers.journal(legs jsonb) → uuid[]
+
+-- N-way split by integer percent. Percentages must sum to exactly 100;
+-- floor-division rounding dust goes to remainder_to.
+transfers.split(source uuid, destinations jsonb, total bigint, ledger int, code int,
+                remainder_to uuid) → uuid[]
+
+-- Fan-out with mixed fixed/percent/remainder destinations. Each entry is
+-- exactly one of: {"to":uuid,"amount":int} | {"to":uuid,"pct":int}
+-- | {"to":uuid,"remainder":true}. At most one remainder. Atomic LINKED chain.
+transfers.allocate(source uuid, destinations jsonb, total bigint, ledger int, code int) → uuid[]
+
+-- Fallback cascade: pull `total` from sources in order, each contributing up
+-- to its `max` cap. Entries: {"from":uuid,"max":int|null} — max=null drains
+-- the source's available balance. Errors if caps don't cover the total.
+transfers.waterfall(destination uuid, sources jsonb, total bigint, ledger int, code int) → uuid[]
+
+-- Lookups. Return 0 rows if not found.
+transfers.get(id uuid) → table(...)
+
+-- Query-by-coordinate.
+transfers.search(ledger int default 0, code int default 0, limit int default 10, flags int default 0) → setof record
+
+-- Post an opposite-direction transfer referencing an original. Same amount,
+-- ledger, code; debit/credit swapped. Rejects two-phase originals — use
+-- transfers.release / transfers.capture instead.
+transfers.reverse(id uuid, original_id uuid) → uuid
 ```
 
 See `sql/smoke.sql` for a full round-trip example covering every function.

@@ -1,4 +1,4 @@
--- pgbench-driven multi-client bench for post_transfer.
+-- pgbench-driven multi-client bench for transfers.post.
 --
 -- Usage (after accounts are seeded, see bench_setup.sql):
 --   pgbench -n -c 16 -j 4 -T 10 -f sql/bench_transfer.sql \
@@ -12,7 +12,8 @@
 \set b random(1, 128)
 \set amt 1
 
-SELECT post_transfer(
+SELECT transfers.post(
+    gen_random_uuid(),
     ('00000000-0000-0000-0000-' || lpad(to_hex(:a), 12, '0'))::uuid,
     ('00000000-0000-0000-0000-' || lpad(to_hex(:b + 10000), 12, '0'))::uuid,
     :amt,

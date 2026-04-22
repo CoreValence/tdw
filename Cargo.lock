@@ -39,8 +39,10 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "pgrx",
+ "serde_json",
  "tigerbeetle-unofficial",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

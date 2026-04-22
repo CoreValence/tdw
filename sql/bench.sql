@@ -1,4 +1,4 @@
--- Benchmark post_transfer RPC round-trip (SQL → shmem slot → bgworker → TB → back).
+-- Benchmark transfers.post RPC round-trip (SQL → shmem slot → bgworker → TB → back).
 --
 -- Usage:
 --   psql -v N=1000 -f sql/bench.sql
@@ -25,13 +25,13 @@ DECLARE
     total_ms  numeric;
     p50       bigint; p95 bigint; p99 bigint; pmax bigint;
 BEGIN
-    PERFORM post_account(debit,  1, 100);
-    PERFORM post_account(credit, 1, 100);
+    PERFORM accounts.open(debit,  1, 100);
+    PERFORM accounts.open(credit, 1, 100);
 
     total_t0 := clock_timestamp();
     FOR i IN 1..n LOOP
         t0 := clock_timestamp();
-        PERFORM post_transfer(debit, credit, 1, 1, 10);
+        PERFORM transfers.post(gen_random_uuid(), debit, credit, 1, 1, 10);
         t1 := clock_timestamp();
         lat[i] := (extract(epoch from (t1 - t0)) * 1000000)::bigint;
     END LOOP;
@@ -44,7 +44,7 @@ BEGIN
     pmax := lat[n];
 
     RAISE NOTICE '';
-    RAISE NOTICE 'post_transfer RPC bench';
+    RAISE NOTICE 'transfers.post RPC bench';
     RAISE NOTICE '  N       = %', n;
     RAISE NOTICE '  total   = % ms', round(total_ms, 2);
     RAISE NOTICE '  tps     = %', round((n::numeric) / (total_ms / 1000), 0);

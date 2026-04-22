@@ -2,16 +2,17 @@ use pgrx::bgworkers::{BackgroundWorker, SignalWakeFlags};
 use pgrx::prelude::*;
 use std::collections::HashMap;
 use std::net::ToSocketAddrs;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use crate::guc::{BATCH_MAX, BATCH_WAIT_MS, TB_ADDR, TB_CLUSTER_ID};
 use crate::pack::{pack_account, pack_balance, pack_transfer};
 use crate::shmem::{
-    CAPACITY, ERR_BUF_LEN, MAX_QUERY_ROWS, OP_CREATE_ACCOUNT, OP_CREATE_TRANSFER,
-    OP_GET_ACCOUNT_BALANCES, OP_GET_ACCOUNT_TRANSFERS, OP_LOOKUP_ACCOUNT, OP_LOOKUP_TRANSFER,
-    OP_QUERY_ACCOUNTS, OP_QUERY_TRANSFERS, RECORD_LEN, RESULT_BUF_LEN, RING, S_DONE, S_ERROR,
-    S_IN_FLIGHT, S_PENDING, WORKER_LATCH,
+    BATCH_LEG_LEN, CAPACITY, ERR_BUF_LEN, MAX_BATCH_LEGS, MAX_QUERY_ROWS, OP_CREATE_ACCOUNT,
+    OP_CREATE_TRANSFER, OP_CREATE_TRANSFER_BATCH, OP_GET_ACCOUNT_BALANCES,
+    OP_GET_ACCOUNT_TRANSFERS, OP_LOOKUP_ACCOUNT, OP_LOOKUP_TRANSFER, OP_QUERY_ACCOUNTS,
+    OP_QUERY_TRANSFERS, RECORD_LEN, RESULT_BUF_LEN, RING, S_DONE, S_ERROR, S_IN_FLIGHT, S_PENDING,
+    WORKER_LATCH,
 };
 
 // pgrx's attach_signal_handlers gets clobbered because TB's Zig runtime sets
@@ -65,20 +66,35 @@ fn resolve_tb_addr(raw: &str) -> String {
 struct Pending {
     slot_idx: usize,
     op: u8,
+    id: u128,
     debit_id: u128,
     credit_id: u128,
+    pending_id: u128,
     amount: u128,
     ledger: u32,
     code: u16,
     flags: u32,
     limit: u32,
-    assigned_id: u128,
+    // OP_CREATE_TRANSFER_BATCH only: leg descriptors unpacked from result_buf.
+    batch_legs: Vec<BatchLeg>,
+}
+
+struct BatchLeg {
+    id: u128,
+    debit_id: u128,
+    credit_id: u128,
+    pending_id: u128,
+    amount: u128,
+    ledger: u32,
+    code: u16,
+    flags: u16,
 }
 
 enum Outcome {
-    // Write ops: 16-byte id packed as one record (count = 1).
+    // Single-record writes: 16-byte id packed as one record (count = 1).
     // Single-row reads: one RECORD_LEN record (count = 1).
     // Multi-row reads: N records (each RECORD_LEN bytes) concatenated.
+    // Batch writes: N × 16-byte ids packed back-to-back (count = N).
     Ok { count: u32, bytes: Vec<u8> },
     Err(String),
 }
@@ -87,6 +103,21 @@ fn outcome_id(id: u128) -> Outcome {
     let mut bytes = vec![0u8; RECORD_LEN];
     bytes[..16].copy_from_slice(&id.to_le_bytes());
     Outcome::Ok { count: 1, bytes }
+}
+
+fn outcome_ids(ids: &[u128]) -> Outcome {
+    // Pad each id out to RECORD_LEN so the client side can walk them with
+    // ReadBack::record() at the usual RECORD_LEN stride, same as any other
+    // read. Only the first 16 bytes of each slot carry data.
+    let mut bytes = vec![0u8; ids.len() * RECORD_LEN];
+    for (i, id) in ids.iter().enumerate() {
+        let o = i * RECORD_LEN;
+        bytes[o..o + 16].copy_from_slice(&id.to_le_bytes());
+    }
+    Outcome::Ok {
+        count: ids.len() as u32,
+        bytes,
+    }
 }
 
 fn outcome_single(record: [u8; RECORD_LEN]) -> Outcome {
@@ -196,26 +227,43 @@ fn drain_pending() -> Vec<Pending> {
         let s = &mut guard.slots[i];
         if s.state == S_PENDING {
             s.state = S_IN_FLIGHT;
-            let assigned = if s.op == OP_CREATE_TRANSFER {
-                next_transfer_id()
+            let batch_legs = if s.op == OP_CREATE_TRANSFER_BATCH {
+                let n = (s.limit as usize).min(MAX_BATCH_LEGS);
+                (0..n).map(|k| unpack_batch_leg(&s.result_buf, k)).collect()
             } else {
-                u128::from_le_bytes(s.debit_id)
+                Vec::new()
             };
             out.push(Pending {
                 slot_idx: i,
                 op: s.op,
+                id: u128::from_le_bytes(s.id),
                 debit_id: u128::from_le_bytes(s.debit_id),
                 credit_id: u128::from_le_bytes(s.credit_id),
+                pending_id: u128::from_le_bytes(s.pending_id),
                 amount: s.amount,
                 ledger: s.ledger,
                 code: s.code,
                 flags: s.flags,
                 limit: s.limit,
-                assigned_id: assigned,
+                batch_legs,
             });
         }
     }
     out
+}
+
+fn unpack_batch_leg(buf: &[u8; RESULT_BUF_LEN], idx: usize) -> BatchLeg {
+    let o = idx * BATCH_LEG_LEN;
+    BatchLeg {
+        id:         u128::from_le_bytes(buf[o     ..o + 16].try_into().unwrap()),
+        debit_id:   u128::from_le_bytes(buf[o + 16..o + 32].try_into().unwrap()),
+        credit_id:  u128::from_le_bytes(buf[o + 32..o + 48].try_into().unwrap()),
+        pending_id: u128::from_le_bytes(buf[o + 48..o + 64].try_into().unwrap()),
+        amount:     u128::from_le_bytes(buf[o + 64..o + 80].try_into().unwrap()),
+        ledger:     u32::from_le_bytes( buf[o + 80..o + 84].try_into().unwrap()),
+        code:       u16::from_le_bytes( buf[o + 84..o + 86].try_into().unwrap()),
+        flags:      u16::from_le_bytes( buf[o + 86..o + 88].try_into().unwrap()),
+    }
 }
 
 fn run_batch(
@@ -254,13 +302,13 @@ fn run_batch(
             .iter()
             .map(|&i| {
                 let p = &pending[i];
-                tigerbeetle_unofficial::Account::new(p.assigned_id, p.ledger, p.code).with_flags(
+                tigerbeetle_unofficial::Account::new(p.id, p.ledger, p.code).with_flags(
                     tigerbeetle_unofficial::account::Flags::from_bits_retain(p.flags as u16),
                 )
             })
             .collect();
         let res = rt.block_on(client.create_accounts(accounts));
-        apply_batch(
+        apply_batch_ids(
             &account_idx,
             pending,
             &mut outcomes,
@@ -274,7 +322,7 @@ fn run_batch(
             .iter()
             .map(|&i| {
                 let p = &pending[i];
-                tigerbeetle_unofficial::Transfer::new(p.assigned_id)
+                let mut t = tigerbeetle_unofficial::Transfer::new(p.id)
                     .with_debit_account_id(p.debit_id)
                     .with_credit_account_id(p.credit_id)
                     .with_amount(p.amount)
@@ -282,11 +330,15 @@ fn run_batch(
                     .with_code(p.code)
                     .with_flags(tigerbeetle_unofficial::transfer::Flags::from_bits_retain(
                         p.flags as u16,
-                    ))
+                    ));
+                if p.pending_id != 0 {
+                    t = t.with_pending_id(p.pending_id);
+                }
+                t
             })
             .collect();
         let res = rt.block_on(client.create_transfers(transfers));
-        apply_batch(
+        apply_batch_ids(
             &transfer_idx,
             pending,
             &mut outcomes,
@@ -295,17 +347,64 @@ fn run_batch(
         );
     }
 
-    if !lookup_account_idx.is_empty() {
-        let ids: Vec<u128> = lookup_account_idx
+    // Each batch slot runs as its own create_transfers call so that a LINKED
+    // chain inside the batch stays contiguous in the TB request. Folding batch
+    // legs into the shared transfer_idx call would work but makes the error
+    // index → slot mapping ugly; the extra round-trip is cheap relative to
+    // the typical cost of building such a batch.
+    for (i, p) in pending.iter().enumerate() {
+        if p.op != OP_CREATE_TRANSFER_BATCH {
+            continue;
+        }
+        let transfers: Vec<_> = p
+            .batch_legs
             .iter()
-            .map(|&i| pending[i].debit_id)
+            .map(|leg| {
+                let mut t = tigerbeetle_unofficial::Transfer::new(leg.id)
+                    .with_debit_account_id(leg.debit_id)
+                    .with_credit_account_id(leg.credit_id)
+                    .with_amount(leg.amount)
+                    .with_ledger(leg.ledger)
+                    .with_code(leg.code)
+                    .with_flags(tigerbeetle_unofficial::transfer::Flags::from_bits_retain(
+                        leg.flags,
+                    ));
+                if leg.pending_id != 0 {
+                    t = t.with_pending_id(leg.pending_id);
+                }
+                t
+            })
             .collect();
+        outcomes[i] = match rt.block_on(client.create_transfers(transfers)) {
+            Ok(()) => {
+                let ids: Vec<u128> = p.batch_legs.iter().map(|leg| leg.id).collect();
+                outcome_ids(&ids)
+            }
+            Err(e) => match format_transfers_err(&e) {
+                // Any per-index error fails the whole batch from the client's
+                // point of view — LINKED rollback means no leg in the chain
+                // actually committed, so returning partial ids would be a lie.
+                BatchErr::SendAll(msg) => Outcome::Err(msg),
+                BatchErr::PerIndex(errs) => {
+                    let first = errs
+                        .iter()
+                        .min_by_key(|(idx, _)| *idx)
+                        .map(|(idx, msg)| format!("leg {}: {}", idx, msg))
+                        .unwrap_or_else(|| "batch failed".into());
+                    Outcome::Err(first)
+                }
+            },
+        };
+    }
+
+    if !lookup_account_idx.is_empty() {
+        let ids: Vec<u128> = lookup_account_idx.iter().map(|&i| pending[i].id).collect();
         match rt.block_on(client.lookup_accounts(ids.clone())) {
             Ok(found) => {
                 let by_id: HashMap<u128, tigerbeetle_unofficial::Account> =
                     found.into_iter().map(|a| (a.id(), a)).collect();
                 for &i in &lookup_account_idx {
-                    outcomes[i] = match by_id.get(&pending[i].debit_id) {
+                    outcomes[i] = match by_id.get(&pending[i].id) {
                         Some(a) => outcome_single(pack_account(a)),
                         None => Outcome::Err("not found".into()),
                     };
@@ -322,14 +421,14 @@ fn run_batch(
     if !lookup_transfer_idx.is_empty() {
         let ids: Vec<u128> = lookup_transfer_idx
             .iter()
-            .map(|&i| pending[i].debit_id)
+            .map(|&i| pending[i].id)
             .collect();
         match rt.block_on(client.lookup_transfers(ids.clone())) {
             Ok(found) => {
                 let by_id: HashMap<u128, tigerbeetle_unofficial::Transfer> =
                     found.into_iter().map(|t| (t.id(), t)).collect();
                 for &i in &lookup_transfer_idx {
-                    outcomes[i] = match by_id.get(&pending[i].debit_id) {
+                    outcomes[i] = match by_id.get(&pending[i].id) {
                         Some(t) => outcome_single(pack_transfer(t)),
                         None => Outcome::Err("not found".into()),
                     };
@@ -385,7 +484,7 @@ fn run_account_transfers(
 ) -> Outcome {
     let limit = p.limit.clamp(1, MAX_QUERY_ROWS);
     let filter = Box::new(
-        tigerbeetle_unofficial::account::Filter::new(p.debit_id, limit)
+        tigerbeetle_unofficial::account::Filter::new(p.id, limit)
             .with_flags(tigerbeetle_unofficial::account::FilterFlags::from_bits_retain(p.flags)),
     );
     match rt.block_on(client.get_account_transfers(filter)) {
@@ -404,7 +503,7 @@ fn run_account_balances(
 ) -> Outcome {
     let limit = p.limit.clamp(1, MAX_QUERY_ROWS);
     let filter = Box::new(
-        tigerbeetle_unofficial::account::Filter::new(p.debit_id, limit)
+        tigerbeetle_unofficial::account::Filter::new(p.id, limit)
             .with_flags(tigerbeetle_unofficial::account::FilterFlags::from_bits_retain(p.flags)),
     );
     match rt.block_on(client.get_account_balances(filter)) {
@@ -462,7 +561,7 @@ fn run_query_transfers(
     }
 }
 
-fn apply_batch<E, F>(
+fn apply_batch_ids<E, F>(
     indices: &[usize],
     pending: &[Pending],
     outcomes: &mut [Outcome],
@@ -474,7 +573,7 @@ fn apply_batch<E, F>(
     match result {
         Ok(()) => {
             for &i in indices {
-                outcomes[i] = outcome_id(pending[i].assigned_id);
+                outcomes[i] = outcome_id(pending[i].id);
             }
         }
         Err(e) => match format(&e) {
@@ -489,7 +588,7 @@ fn apply_batch<E, F>(
                     if let Some(msg) = err_map.remove(&(offset as u32)) {
                         outcomes[i] = Outcome::Err(msg);
                     } else {
-                        outcomes[i] = outcome_id(pending[i].assigned_id);
+                        outcomes[i] = outcome_id(pending[i].id);
                     }
                 }
             }
@@ -555,19 +654,3 @@ fn publish_outcomes(pending: Vec<Pending>, outcomes: Vec<Outcome>) -> Vec<usize>
     latches
 }
 
-fn next_transfer_id() -> u128 {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(1);
-    let bump = COUNTER.fetch_add(1, Ordering::Relaxed) as u128;
-    let id = now.saturating_add(bump);
-    if id == 0 {
-        1
-    } else if id == u128::MAX {
-        u128::MAX - 1
-    } else {
-        id
-    }
-}

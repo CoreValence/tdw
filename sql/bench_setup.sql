@@ -17,7 +17,7 @@ DECLARE
 BEGIN
     FOR i IN 1..128 LOOP
         BEGIN
-            PERFORM post_account(
+            PERFORM accounts.open(
                 ('00000000-0000-0000-0000-' || lpad(to_hex(i), 12, '0'))::uuid,
                 1, 100);
             created := created + 1;
@@ -30,7 +30,7 @@ BEGIN
         END;
 
         BEGIN
-            PERFORM post_account(
+            PERFORM accounts.open(
                 ('00000000-0000-0000-0000-' || lpad(to_hex(i + 10000), 12, '0'))::uuid,
                 1, 100);
             created := created + 1;
