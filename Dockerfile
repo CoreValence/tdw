@@ -9,9 +9,13 @@
 
 FROM rust:1-bookworm AS builder
 
-# Postgres 18 dev headers from PGDG, plus clang for bindgen.
-RUN --mount=type=cache,target=/var/cache/apt \
-    --mount=type=cache,target=/var/lib/apt \
+ARG TARGETARCH
+
+# Postgres 18 dev headers from PGDG, plus clang for bindgen. Cache mounts are
+# partitioned by target arch so parallel amd64/arm64 builds don't fight over
+# /var/cache/apt or /usr/local/cargo/registry locks.
+RUN --mount=type=cache,target=/var/cache/apt,id=apt-${TARGETARCH} \
+    --mount=type=cache,target=/var/lib/apt,id=apt-lib-${TARGETARCH} \
     apt-get update && apt-get install -y --no-install-recommends \
         curl ca-certificates gnupg lsb-release build-essential \
         libssl-dev libclang-dev pkg-config clang git \
@@ -25,7 +29,7 @@ RUN --mount=type=cache,target=/var/cache/apt \
 ENV PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config
 
 # pgrx cli pinned to match [dependencies].
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
+RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-${TARGETARCH} \
     cargo install --locked --version =0.18.0 cargo-pgrx
 
 # Register the system pg18 install with pgrx; skip the managed-postgres build.
@@ -36,17 +40,43 @@ COPY Cargo.toml Cargo.lock beetle.control ./
 COPY .cargo ./.cargo
 COPY src ./src
 
-# Release build → baked into postgres:18-bookworm in the runtime stage.
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/build/target \
-    cargo pgrx install --release --pg-config "$PG_CONFIG"
+# On x86_64, Zig's libtb_client.a has initial-exec TLS relocations
+# (R_X86_64_TPOFF32) that cannot be linked into a -shared cdylib. Patch
+# the sys crate to link libtb_client.so dynamically and add $ORIGIN rpath
+# so the loader finds it next to beetle.so. aarch64 accepts the equivalent
+# TLS relocations from the static archive and is unaffected.
+#
+# Everything runs in a single RUN so the sed patch, the $ORIGIN-linked
+# build, and the libtb_client.so extraction all see the same /build/target
+# cache mount. Artifacts are copied into /export/ (persisted in the image
+# layer) for the runtime stage to pick up.
+RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-${TARGETARCH} \
+    --mount=type=cache,target=/build/target,id=target-${TARGETARCH} \
+    set -eux; \
+    cargo fetch; \
+    RUSTFLAGS=""; \
+    if [ "$(uname -m)" = "x86_64" ]; then \
+        CRATE_DIR=$(find /usr/local/cargo/registry/src -maxdepth 2 -type d \
+            -name 'tigerbeetle-unofficial-sys-*' | head -1); \
+        test -n "$CRATE_DIR"; \
+        sed -i 's|cargo:rustc-link-lib=static=tb_client|cargo:rustc-link-lib=dylib=tb_client|' \
+            "$CRATE_DIR/build.rs"; \
+        RUSTFLAGS='-C link-arg=-Wl,-rpath,$ORIGIN'; \
+    fi; \
+    RUSTFLAGS="$RUSTFLAGS" cargo pgrx install --release --pg-config "$PG_CONFIG"; \
+    mkdir -p /export/lib /export/ext; \
+    cp /usr/lib/postgresql/18/lib/beetle.so /export/lib/; \
+    cp /usr/share/postgresql/18/extension/beetle.control /export/ext/; \
+    cp /usr/share/postgresql/18/extension/beetle--*.sql /export/ext/; \
+    if [ "$(uname -m)" = "x86_64" ]; then \
+        TB_SO=$(find target/release/build -name 'libtb_client.so' \
+            -path '*x86_64-linux-gnu*' | head -1); \
+        test -n "$TB_SO"; \
+        cp "$TB_SO" /export/lib/; \
+    fi
 
 
 FROM postgres:18-bookworm AS runtime
 
-COPY --from=builder /usr/lib/postgresql/18/lib/beetle.so \
-                    /usr/lib/postgresql/18/lib/beetle.so
-COPY --from=builder /usr/share/postgresql/18/extension/beetle.control \
-                    /usr/share/postgresql/18/extension/beetle.control
-COPY --from=builder /usr/share/postgresql/18/extension/beetle--0.1.0.sql \
-                    /usr/share/postgresql/18/extension/beetle--0.1.0.sql
+COPY --from=builder /export/lib/ /usr/lib/postgresql/18/lib/
+COPY --from=builder /export/ext/ /usr/share/postgresql/18/extension/
