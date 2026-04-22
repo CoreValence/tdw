@@ -1,0 +1,158 @@
+![](./assets/banner.png)
+
+# beetle
+
+A programmable ledger layer on [TigerBeetle](https://tigerbeetle.com/), packaged as a [PostgreSQL extension](https://www.postgresql.org/docs/current/extend-extensions.html).
+
+`beetle` lets you post accounts, post transfers, and query balances/history from plain SQL — while TigerBeetle stays authoritative for the double-entry state. A background worker inside Postgres batches requests from regular backends into the TB client, so each connection only pays for a shared-memory enqueue instead of holding its own socket to the cluster.
+
+## Requirements
+
+- PostgreSQL 15, 16, 17, or 18
+- A running TigerBeetle cluster (single replica for dev, three for production)
+- `shared_preload_libraries = 'beetle'` in `postgresql.conf`
+
+## Quick start
+
+The fastest way to try it is the bundled `compose.yml`, which brings up a three-replica TB cluster, a Postgres 18 image with `beetle` preloaded, and a one-shot smoke/bench runner.
+
+```sh
+docker compose up -d postgres
+psql -h localhost -p 28819 -U postgres -d beetle -f sql/smoke.sql
+```
+
+Run the bundled pgbench profile:
+
+```sh
+CLIENTS=128 DURATION=60 docker compose run --rm bench
+```
+
+## Install (from release tarball)
+
+Each tagged release publishes prebuilt extension bundles per Postgres major × arch on the [Releases page](https://github.com/CoreValence/beetle/releases). Download the matching tarball and extract into your Postgres installation:
+
+```sh
+tar xzf beetle-0.1.0-pg18-linux-amd64.tar.gz -C /
+```
+
+Then in `postgresql.conf`:
+
+```
+shared_preload_libraries = 'beetle'
+beetle.tb_addr           = '172.30.0.10:3000,172.30.0.11:3000,172.30.0.12:3000'
+beetle.tb_cluster_id     = '1'
+```
+
+Restart Postgres, then per database:
+
+```sql
+CREATE EXTENSION beetle;
+```
+
+## Configuration
+
+All settings are standard Postgres GUCs.
+
+| GUC                    | Context    | Default | Description                                                                                                       |
+| ---------------------- | ---------- | ------- | ----------------------------------------------------------------------------------------------------------------- |
+| `beetle.tb_addr`       | Postmaster | `3000`  | Comma-separated TB replica addresses (`port`, `ip:port`, or `host:port`). Hostnames resolved once at worker start |
+| `beetle.tb_cluster_id` | Postmaster | `0`     | TigerBeetle cluster id (u128, decimal). Must match the value the replica was formatted with                       |
+| `beetle.batch_wait_ms` | Sighup     | `1`     | Worker idle wait between batch drains, ms. Lower = lower latency, higher = larger batches                         |
+| `beetle.batch_max`     | Sighup     | `8189`  | Max slots drained per TB request. Capped by TB's 8189-per-message limit                                           |
+
+## Usage
+
+A round-trip: post two accounts, move money between them, and read the balances back.
+
+```sql
+CREATE EXTENSION beetle;
+
+DO $$
+DECLARE
+    alice uuid := gen_random_uuid();
+    bob   uuid := gen_random_uuid();
+    xfer  uuid;
+BEGIN
+    PERFORM post_account(alice, 1, 100);
+    PERFORM post_account(bob,   1, 100);
+    xfer := post_transfer(alice, bob, 1000, 1, 10);
+    RAISE NOTICE 'transfer %', xfer;
+END $$;
+
+SELECT debits_posted, credits_posted, ledger, code FROM lookup_account(alice);
+--  debits_posted | credits_posted | ledger | code
+-- ---------------+----------------+--------+------
+--           1000 |              0 |      1 |  100
+```
+
+Per-transfer balance snapshots (the TB `HISTORY` flag = 8 must be set at account creation):
+
+```sql
+PERFORM post_account(alice, 1, 100, 8);
+-- … post a few transfers against alice …
+SELECT timestamp, debits_posted, credits_posted FROM account_balances(alice) LIMIT 10;
+```
+
+Account-scoped transfer history with a TB flag bitfield (`DEBITS = 1`, `CREDITS = 2`):
+
+```sql
+-- outgoing transfers from alice only
+SELECT id, credit, amount FROM account_transfers(alice, 50, 1);
+```
+
+Global scan by ledger/code coordinate:
+
+```sql
+SELECT id, debit, credit, amount FROM query_transfers(1, 10, 100);
+```
+
+## SQL API
+
+```sql
+-- Create an account. flags is the raw TB bitfield (HISTORY = 8, LINKED = 1, …).
+post_account(id uuid, ledger int, code int, flags int default 0) → void
+
+-- Post a transfer; returns the transfer id (same as the one generated server-side).
+post_transfer(debit uuid, credit uuid, amount numeric, ledger int, code int) → uuid
+
+-- Lookups — return 0 rows if not found.
+lookup_account(id uuid)  → table(...)
+lookup_transfer(id uuid) → table(...)
+
+-- History scoped to an account.
+account_transfers(account_id uuid, limit int default 10, flags int default 0) → setof record
+account_balances (account_id uuid, limit int default 10)                      → setof record
+
+-- Query-by-coordinate.
+query_accounts (ledger int default 0, code int default 0, limit int default 10) → setof record
+query_transfers(ledger int default 0, code int default 0, limit int default 10) → setof record
+```
+
+See `sql/smoke.sql` for a full round-trip example covering every function.
+
+## Architecture
+
+![](./assets/banner-arch.png)
+
+Each `post_*` call packs its request into a fixed-size slot in the shared-memory ring, wakes the worker's latch, and waits on a per-slot condvar for the outcome. The worker drains up to `batch_max` slots per TB round-trip.
+
+## Development
+
+Build against a specific Postgres major:
+
+```sh
+cargo pgrx init --pg18 $(which pg_config)
+cargo pgrx run pg18
+```
+
+Package an installable bundle (what the release workflow does):
+
+```sh
+cargo pgrx package --features pg18 --pg-config $(which pg_config)
+```
+
+The `.github/workflows/release.yml` CI matrix builds `pg15..pg18 × {amd64, arm64}` tarballs and attaches them to tagged releases.
+
+## License
+
+TBD.

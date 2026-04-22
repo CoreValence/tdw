@@ -49,11 +49,9 @@ jobs:
         with:
           tool: cargo-pgrx@0.18.0
 
-      - name: Initialize pgrx
-        run: cargo pgrx init --pg${{ matrix.pg }} /usr/lib/postgresql/${{ matrix.pg
-          }}/bin/pg_config
-
       - name: Package
+        env:
+          PGRX_PG_CONFIG_PATH: /usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
         run: |
           cargo pgrx package \
             --no-default-features \
