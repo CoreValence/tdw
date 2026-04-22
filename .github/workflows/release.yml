@@ -1,0 +1,107 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [ 15, 16, 17, 18 ]
+        arch: [ amd64, arm64 ]
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PostgreSQL ${{ matrix.pg }} dev headers
+        run: |
+          sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/postgresql.gpg
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            postgresql-server-dev-${{ matrix.pg }} \
+            build-essential libclang-dev clang pkg-config libssl-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: pg${{ matrix.pg }}-${{ matrix.arch }}
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-pgrx@0.18.0
+
+      - name: Initialize pgrx
+        run: cargo pgrx init --pg${{ matrix.pg }} /usr/lib/postgresql/${{ matrix.pg
+          }}/bin/pg_config
+
+      - name: Package
+        run: |
+          cargo pgrx package \
+            --no-default-features \
+            --features pg${{ matrix.pg }} \
+            --pg-config /usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
+
+      - name: Read version
+        id: version
+        run: echo "version=$(grep -m1 '^version' Cargo.toml | cut -d '\"' -f 2)" >>
+          "$GITHUB_OUTPUT"
+
+      - name: Tarball
+        id: tarball
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          PG: ${{ matrix.pg }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          NAME="beetle-${VERSION}-pg${PG}-linux-${ARCH}"
+          mkdir -p dist
+          tar czf "dist/${NAME}.tar.gz" -C "target/release/beetle-pg${PG}" .
+          (cd dist && sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256")
+          echo "name=${NAME}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.tarball.outputs.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify Cargo.toml version matches tag
+        run: |
+          VER=$(grep -m1 '^version' Cargo.toml | cut -d '"' -f 2)
+          if [ "v${VER}" != "${GITHUB_REF_NAME}" ]; then
+            echo "tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${VER}" >&2
+            exit 1
+          fi
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: dist/*
+          name: ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name }}
