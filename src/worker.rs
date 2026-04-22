@@ -122,7 +122,10 @@ pub extern "C-unwind" fn beetle_worker_main(_arg: pg_sys::Datum) {
         .and_then(|s| s.into_string().ok())
         .unwrap_or_default();
     let cluster_id: u128 = cluster_id_raw.parse().unwrap_or_else(|e| {
-        error!("beetle: invalid beetle.tb_cluster_id={:?}: {}", cluster_id_raw, e)
+        error!(
+            "beetle: invalid beetle.tb_cluster_id={:?}: {}",
+            cluster_id_raw, e
+        )
     });
 
     log!(
