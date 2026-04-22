@@ -1,30 +1,67 @@
 services:
   tigerbeetle-init:
     image: ghcr.io/tigerbeetle/tigerbeetle:0.16.78
-    entrypoint: ["/bin/sh", "-c"]
+    entrypoint: [ "/bin/sh", "-c" ]
     command:
       - |
-        if [ ! -f /data/0_0.tigerbeetle ]; then
-          /tigerbeetle format --cluster=0 --replica=0 --replica-count=1 /data/0_0.tigerbeetle
-        else
-          echo "already formatted"
-        fi
+        for i in 0 1 2; do
+          if [ ! -f /data/0_$$i.tigerbeetle ]; then
+            /tigerbeetle format --cluster=1 --replica=$$i --replica-count=3 /data/0_$$i.tigerbeetle
+          else
+            echo "already formatted: 0_$$i"
+          fi
+        done
     restart: "no"
     security_opt:
       - seccomp=unconfined
     volumes:
       - tigerbeetle-data:/data
 
-  tigerbeetle:
+  # Three replicas on a fixed-IP bridge network. TB's --addresses= does not
+  # resolve DNS, so each replica boots with the same IP list in cluster-index
+  # order. All three share one volume with per-replica filenames (0_<i>.tigerbeetle).
+  tigerbeetle-0:
     image: ghcr.io/tigerbeetle/tigerbeetle:0.16.78
-    command: start --addresses=0.0.0.0:3000 /data/0_0.tigerbeetle
+    command: start --addresses=172.30.0.10:3000,172.30.0.11:3000,172.30.0.12:3000
+      /data/0_0.tigerbeetle
     restart: unless-stopped
-    cap_add:
-      - IPC_LOCK
-    security_opt:
-      - seccomp=unconfined
-    ports:
-      - "3000:3000"
+    cap_add: [ IPC_LOCK ]
+    security_opt: [ seccomp=unconfined ]
+    networks:
+      beetle-net:
+        ipv4_address: 172.30.0.10
+    volumes:
+      - tigerbeetle-data:/data
+    depends_on:
+      tigerbeetle-init:
+        condition: service_completed_successfully
+
+  tigerbeetle-1:
+    image: ghcr.io/tigerbeetle/tigerbeetle:0.16.78
+    command: start --addresses=172.30.0.10:3000,172.30.0.11:3000,172.30.0.12:3000
+      /data/0_1.tigerbeetle
+    restart: unless-stopped
+    cap_add: [ IPC_LOCK ]
+    security_opt: [ seccomp=unconfined ]
+    networks:
+      beetle-net:
+        ipv4_address: 172.30.0.11
+    volumes:
+      - tigerbeetle-data:/data
+    depends_on:
+      tigerbeetle-init:
+        condition: service_completed_successfully
+
+  tigerbeetle-2:
+    image: ghcr.io/tigerbeetle/tigerbeetle:0.16.78
+    command: start --addresses=172.30.0.10:3000,172.30.0.11:3000,172.30.0.12:3000
+      /data/0_2.tigerbeetle
+    restart: unless-stopped
+    cap_add: [ IPC_LOCK ]
+    security_opt: [ seccomp=unconfined ]
+    networks:
+      beetle-net:
+        ipv4_address: 172.30.0.12
     volumes:
       - tigerbeetle-data:/data
     depends_on:
@@ -36,7 +73,11 @@ services:
       context: .
       dockerfile: Dockerfile
     depends_on:
-      tigerbeetle:
+      tigerbeetle-0:
+        condition: service_started
+      tigerbeetle-1:
+        condition: service_started
+      tigerbeetle-2:
         condition: service_started
     # TB's Zig client uses io_uring for TCP; Docker's default seccomp blocks it.
     security_opt:
@@ -44,6 +85,8 @@ services:
     environment:
       POSTGRES_DB: beetle
       POSTGRES_HOST_AUTH_METHOD: trust
+    networks:
+      - beetle-net
     command:
       - postgres
       - -c
@@ -51,13 +94,13 @@ services:
       - -c
       - max_connections=1024
       - -c
-      - beetle.tb_addr=tigerbeetle:3000
+      - beetle.tb_addr=172.30.0.10:3000,172.30.0.11:3000,172.30.0.12:3000
       - -c
-      - beetle.tb_cluster_id=0
+      - beetle.tb_cluster_id=1
     ports:
       - "28819:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d beetle"]
+      test: [ "CMD-SHELL", "pg_isready -U postgres -d beetle" ]
       interval: 1s
       timeout: 3s
       retries: 60
@@ -68,21 +111,23 @@ services:
   #   CLIENTS=64 DURATION=30 JOBS=8 docker compose run --rm bench
   bench:
     image: postgres:18-bookworm
-    profiles: ["bench"]
+    profiles: [ "bench" ]
     depends_on:
       postgres:
         condition: service_healthy
+    networks:
+      - beetle-net
     environment:
       PGHOST: postgres
       PGPORT: "5432"
       PGDATABASE: beetle
       PGUSER: postgres
       CLIENTS: "${CLIENTS:-128}"
-      DURATION: "${DURATION:-15}"
+      DURATION: "${DURATION:-60}"
       JOBS: "${JOBS:-4}"
     volumes:
       - ./sql:/sql:ro
-    entrypoint: ["/bin/bash", "-eu", "-o", "pipefail", "-c"]
+    entrypoint: [ "/bin/bash", "-eu", "-o", "pipefail", "-c" ]
     command:
       - |
         echo "== smoke =="
@@ -94,6 +139,13 @@ services:
         echo "== pgbench  c=$$CLIENTS  j=$$JOBS  T=$${DURATION}s =="
         pgbench -n -c "$$CLIENTS" -j "$$JOBS" -T "$$DURATION" \
                 -f /sql/bench_transfer.sql
+
+networks:
+  beetle-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
 
 volumes:
   tigerbeetle-data:
