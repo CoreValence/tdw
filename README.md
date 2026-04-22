@@ -29,11 +29,21 @@ CLIENTS=128 DURATION=60 docker compose run --rm bench
 
 ## Install (from release tarball)
 
-Each tagged release publishes prebuilt extension bundles per Postgres major × arch on the [Releases page](https://github.com/CoreValence/beetle/releases). Download the matching tarball and extract into your Postgres installation:
+Each tagged release ships prebuilt bundles on the [Releases page](https://github.com/CoreValence/beetle/releases), one per Postgres major (15–18) and arch (amd64, arm64). Pick the file matching your setup:
+
+```
+beetle-<version>-pg<major>-linux-<arch>.tar.gz
+```
+
+The tarball uses Debian's standard Postgres layout (`/usr/lib/postgresql/<major>/lib/` for the extension `.so`, `/usr/share/postgresql/<major>/extension/` for the `.control` and `.sql`). On Debian/Ubuntu with the PGDG packages, extract from the filesystem root:
 
 ```sh
-tar xzf beetle-0.1.0-pg18-linux-amd64.tar.gz -C /
+sudo tar xzf beetle-0.1.0-pg18-linux-amd64.tar.gz -C /
 ```
+
+For a non-Debian install, check `pg_config --pkglibdir` and `pg_config --sharedir` and move the extracted files into those directories instead.
+
+The amd64 bundle contains two shared libraries: `beetle.so` and `libtb_client.so`. Keep them in the same directory — `beetle.so` resolves `libtb_client.so` via `$ORIGIN`. arm64 bundles contain only `beetle.so` (the TigerBeetle client links statically on that arch).
 
 Then in `postgresql.conf`:
 

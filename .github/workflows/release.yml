@@ -49,30 +49,47 @@ jobs:
         with:
           tool: cargo-pgrx@0.18.0
 
-      # Zig builds libtb_client.a without PIC, so its TLS uses initial-exec
-      # (R_X86_64_TPOFF32), which rust-lld rejects when linked into a -shared
-      # cdylib on x86_64. aarch64 accepts the equivalent relocations, so this
-      # patch is only needed for amd64. Forces .pic = true on the tb_client
-      # Zig module → global-dynamic TLS model.
-      - name: Patch tb_client build.zig for PIC TLS (amd64)
+      # Zig's libtb_client.a is compiled with initial-exec TLS
+      # (R_X86_64_TPOFF32 relocations), which cannot be linked into a -shared
+      # cdylib on x86_64 by any Linux linker. Zig exposes no TLS model knob
+      # for static libs, so we link the dynamic libtb_client.so instead and
+      # ship it alongside beetle.so with $ORIGIN rpath. aarch64 accepts the
+      # equivalent TLS relocations from the static archive, so arm64 is
+      # unaffected (tested: arm64 static link succeeds).
+      - name: Patch sys crate to link dynamically (amd64)
         if: matrix.arch == 'amd64'
         run: |
           cargo fetch
           CRATE_DIR=$(find "$HOME/.cargo/registry/src" -maxdepth 2 -type d \
             -name 'tigerbeetle-unofficial-sys-*' | head -1)
           test -n "$CRATE_DIR"
-          sed -i 's|b\.path("src/tigerbeetle/libtb_client\.zig"),|b.path("src/tigerbeetle/libtb_client.zig"), .pic = true,|g' \
-            "$CRATE_DIR/tigerbeetle/build.zig"
-          grep -c '\.pic = true' "$CRATE_DIR/tigerbeetle/build.zig"
+          sed -i 's|cargo:rustc-link-lib=static=tb_client|cargo:rustc-link-lib=dylib=tb_client|' \
+            "$CRATE_DIR/build.rs"
+          grep -n 'cargo:rustc-link-lib=dylib=tb_client' "$CRATE_DIR/build.rs"
 
       - name: Package
         env:
           PGRX_PG_CONFIG_PATH: /usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
+          # $ORIGIN rpath lets the Postgres loader find libtb_client.so next to
+          # beetle.so (amd64 only; arm64 stays static). Harmless on arm64 but
+          # scoped for clarity.
+          RUSTFLAGS: ${{ matrix.arch == 'amd64' && '-C link-arg=-Wl,-rpath,$ORIGIN' || '' }}
         run: |
           cargo pgrx package \
             --no-default-features \
             --features pg${{ matrix.pg }} \
             --pg-config /usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
+
+      - name: Stage libtb_client.so next to beetle.so (amd64)
+        if: matrix.arch == 'amd64'
+        run: |
+          TB_SO=$(find target/release/build -name 'libtb_client.so' \
+            -path '*x86_64-linux-gnu*' | head -1)
+          test -n "$TB_SO"
+          cp "$TB_SO" \
+            target/release/beetle-pg${{ matrix.pg }}/usr/lib/postgresql/${{ matrix.pg }}/lib/
+          ls -la \
+            target/release/beetle-pg${{ matrix.pg }}/usr/lib/postgresql/${{ matrix.pg }}/lib/
 
       - name: Read version
         id: version
