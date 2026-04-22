@@ -35,6 +35,13 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.1
+
+      - name: Export ZIG_PATH
+        run: echo "ZIG_PATH=$(which zig)" >> "$GITHUB_ENV"
+
       - uses: Swatinem/rust-cache@v2
         with:
           key: lint-pg${{ matrix.pg }}
