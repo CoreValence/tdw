@@ -49,6 +49,22 @@ jobs:
         with:
           tool: cargo-pgrx@0.18.0
 
+      # Zig builds libtb_client.a without PIC, so its TLS uses initial-exec
+      # (R_X86_64_TPOFF32), which rust-lld rejects when linked into a -shared
+      # cdylib on x86_64. aarch64 accepts the equivalent relocations, so this
+      # patch is only needed for amd64. Forces .pic = true on the tb_client
+      # Zig module → global-dynamic TLS model.
+      - name: Patch tb_client build.zig for PIC TLS (amd64)
+        if: matrix.arch == 'amd64'
+        run: |
+          cargo fetch
+          CRATE_DIR=$(find "$HOME/.cargo/registry/src" -maxdepth 2 -type d \
+            -name 'tigerbeetle-unofficial-sys-*' | head -1)
+          test -n "$CRATE_DIR"
+          sed -i 's|b\.path("src/tigerbeetle/libtb_client\.zig"),|b.path("src/tigerbeetle/libtb_client.zig"), .pic = true,|g' \
+            "$CRATE_DIR/tigerbeetle/build.zig"
+          grep -c '\.pic = true' "$CRATE_DIR/tigerbeetle/build.zig"
+
       - name: Package
         env:
           PGRX_PG_CONFIG_PATH: /usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
@@ -60,8 +76,9 @@ jobs:
 
       - name: Read version
         id: version
-        run: echo "version=$(grep -m1 '^version' Cargo.toml | cut -d '\"' -f 2)" >>
-          "$GITHUB_OUTPUT"
+        run: |
+          version=$(awk -F'"' '/^version/{print $2; exit}' Cargo.toml)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Tarball
         id: tarball
@@ -93,7 +110,7 @@ jobs:
 
       - name: Verify Cargo.toml version matches tag
         run: |
-          VER=$(grep -m1 '^version' Cargo.toml | cut -d '"' -f 2)
+          VER=$(awk -F'"' '/^version/{print $2; exit}' Cargo.toml)
           if [ "v${VER}" != "${GITHUB_REF_NAME}" ]; then
             echo "tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${VER}" >&2
             exit 1
