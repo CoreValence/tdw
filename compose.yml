@@ -122,9 +122,9 @@ services:
       PGPORT: "5432"
       PGDATABASE: beetle
       PGUSER: postgres
-      CLIENTS: "${CLIENTS:-128}"
+      CLIENTS: "${CLIENTS:-512}"
       DURATION: "${DURATION:-60}"
-      JOBS: "${JOBS:-4}"
+      JOBS: "${JOBS:-32}"
     volumes:
       - ./sql:/sql:ro
     entrypoint: [ "/bin/bash", "-eu", "-o", "pipefail", "-c" ]
