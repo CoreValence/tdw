@@ -173,12 +173,18 @@ fn write_leg(
 }
 
 fn submit_batch(packed: &[u8], count: u32) -> Vec<pgrx::Uuid> {
-    match submit_and_wait(|slot| {
-        slot.op = OP_CREATE_TRANSFER_BATCH;
-        slot.limit = count;
-        // result_buf is used as input on the way in; worker overwrites with ids.
-        slot.result_buf[..packed.len()].copy_from_slice(packed);
-    }) {
+    match crate::submit::submit_and_wait_with_legs(
+        |slot| {
+            slot.op = OP_CREATE_TRANSFER_BATCH;
+            slot.limit = count;
+        },
+        // Legs are packed into the slot's pool entry on the way in; the
+        // worker reads them at drain time and overwrites the entry with ids
+        // on the way out.
+        |buf| {
+            buf[..packed.len()].copy_from_slice(packed);
+        },
+    ) {
         Ok(rb) => (0..rb.count as usize)
             .map(|i| {
                 let rec = rb.record(i).expect("batch id record");

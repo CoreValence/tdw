@@ -11,8 +11,8 @@ use crate::shmem::{
     BATCH_LEG_LEN, CAPACITY, ERR_BUF_LEN, MAX_BATCH_LEGS, MAX_QUERY_ROWS, OP_CREATE_ACCOUNT,
     OP_CREATE_TRANSFER, OP_CREATE_TRANSFER_BATCH, OP_GET_ACCOUNT_BALANCES,
     OP_GET_ACCOUNT_TRANSFERS, OP_LOOKUP_ACCOUNT, OP_LOOKUP_TRANSFER, OP_QUERY_ACCOUNTS,
-    OP_QUERY_TRANSFERS, RECORD_LEN, RESULT_BUF_LEN, RING, S_DONE, S_ERROR, S_IN_FLIGHT, S_PENDING,
-    WORKER_LATCH,
+    OP_QUERY_TRANSFERS, RECORD_LEN, RESULT_BUF_LEN, RESULTS, RING, S_DONE, S_ERROR, S_IN_FLIGHT,
+    S_PENDING, WORKER_LATCH,
 };
 
 // pgrx's attach_signal_handlers gets clobbered because TB's Zig runtime sets
@@ -217,38 +217,56 @@ pub extern "C-unwind" fn beetle_worker_main(_arg: pg_sys::Datum) {
 }
 
 fn drain_pending() -> Vec<Pending> {
-    let mut out = Vec::new();
     let max_batch = BATCH_MAX.get() as usize;
-    let mut guard = RING.exclusive();
-    for i in 0..CAPACITY {
-        if out.len() >= max_batch {
-            break;
-        }
-        let s = &mut guard.slots[i];
-        if s.state == S_PENDING {
-            s.state = S_IN_FLIGHT;
-            let batch_legs = if s.op == OP_CREATE_TRANSFER_BATCH {
-                let n = (s.limit as usize).min(MAX_BATCH_LEGS);
-                (0..n).map(|k| unpack_batch_leg(&s.result_buf, k)).collect()
-            } else {
-                Vec::new()
-            };
-            out.push(Pending {
-                slot_idx: i,
-                op: s.op,
-                id: u128::from_le_bytes(s.id),
-                debit_id: u128::from_le_bytes(s.debit_id),
-                credit_id: u128::from_le_bytes(s.credit_id),
-                pending_id: u128::from_le_bytes(s.pending_id),
-                amount: s.amount,
-                ledger: s.ledger,
-                code: s.code,
-                flags: s.flags,
-                limit: s.limit,
-                batch_legs,
-            });
+    let mut out: Vec<Pending> = Vec::with_capacity(max_batch);
+    // Track slots that need leg data copied out of the pool.
+    let mut batch_slots: Vec<(usize, usize)> = Vec::new();
+    {
+        let mut guard = RING.exclusive();
+        for i in 0..CAPACITY {
+            if out.len() >= max_batch {
+                break;
+            }
+            let s = &mut guard.slots[i];
+            if s.state == S_PENDING {
+                s.state = S_IN_FLIGHT;
+                let is_batch = s.op == OP_CREATE_TRANSFER_BATCH;
+                let idx_in_out = out.len();
+                out.push(Pending {
+                    slot_idx: i,
+                    op: s.op,
+                    id: u128::from_le_bytes(s.id),
+                    debit_id: u128::from_le_bytes(s.debit_id),
+                    credit_id: u128::from_le_bytes(s.credit_id),
+                    pending_id: u128::from_le_bytes(s.pending_id),
+                    amount: s.amount,
+                    ledger: s.ledger,
+                    code: s.code,
+                    flags: s.flags,
+                    limit: s.limit,
+                    batch_legs: Vec::new(),
+                });
+                if is_batch {
+                    batch_slots.push((idx_in_out, i));
+                }
+            }
         }
     }
+
+    // Copy leg data out of the pool without holding RING. Pool entries for
+    // slots in IN_FLIGHT are stable against other parties until we publish
+    // the result, so a shared read is enough.
+    if !batch_slots.is_empty() {
+        let pool = RESULTS.share();
+        for (out_idx, slot_idx) in batch_slots {
+            let p = &mut out[out_idx];
+            let n = (p.limit as usize).min(MAX_BATCH_LEGS);
+            p.batch_legs = (0..n)
+                .map(|k| unpack_batch_leg(&pool.bufs[slot_idx], k))
+                .collect();
+        }
+    }
+
     out
 }
 
@@ -275,27 +293,19 @@ fn run_batch(
         .map(|_| Outcome::Err("not processed".into()))
         .collect();
 
-    let lookup_account_idx: Vec<usize> = pending
-        .iter()
-        .enumerate()
-        .filter_map(|(i, p)| (p.op == OP_LOOKUP_ACCOUNT).then_some(i))
-        .collect();
-    let lookup_transfer_idx: Vec<usize> = pending
-        .iter()
-        .enumerate()
-        .filter_map(|(i, p)| (p.op == OP_LOOKUP_TRANSFER).then_some(i))
-        .collect();
-
-    let account_idx: Vec<usize> = pending
-        .iter()
-        .enumerate()
-        .filter_map(|(i, p)| (p.op == OP_CREATE_ACCOUNT).then_some(i))
-        .collect();
-    let transfer_idx: Vec<usize> = pending
-        .iter()
-        .enumerate()
-        .filter_map(|(i, p)| (p.op == OP_CREATE_TRANSFER).then_some(i))
-        .collect();
+    let mut account_idx: Vec<usize> = Vec::new();
+    let mut transfer_idx: Vec<usize> = Vec::new();
+    let mut lookup_account_idx: Vec<usize> = Vec::new();
+    let mut lookup_transfer_idx: Vec<usize> = Vec::new();
+    for (i, p) in pending.iter().enumerate() {
+        match p.op {
+            OP_CREATE_ACCOUNT => account_idx.push(i),
+            OP_CREATE_TRANSFER => transfer_idx.push(i),
+            OP_LOOKUP_ACCOUNT => lookup_account_idx.push(i),
+            OP_LOOKUP_TRANSFER => lookup_transfer_idx.push(i),
+            _ => {}
+        }
+    }
 
     if !account_idx.is_empty() {
         let accounts: Vec<_> = account_idx
@@ -399,7 +409,7 @@ fn run_batch(
 
     if !lookup_account_idx.is_empty() {
         let ids: Vec<u128> = lookup_account_idx.iter().map(|&i| pending[i].id).collect();
-        match rt.block_on(client.lookup_accounts(ids.clone())) {
+        match rt.block_on(client.lookup_accounts(ids)) {
             Ok(found) => {
                 let by_id: HashMap<u128, tigerbeetle_unofficial::Account> =
                     found.into_iter().map(|a| (a.id(), a)).collect();
@@ -423,7 +433,7 @@ fn run_batch(
             .iter()
             .map(|&i| pending[i].id)
             .collect();
-        match rt.block_on(client.lookup_transfers(ids.clone())) {
+        match rt.block_on(client.lookup_transfers(ids)) {
             Ok(found) => {
                 let by_id: HashMap<u128, tigerbeetle_unofficial::Transfer> =
                     found.into_iter().map(|t| (t.id(), t)).collect();
@@ -582,14 +592,15 @@ fn apply_batch_ids<E, F>(
                     outcomes[i] = Outcome::Err(msg.clone());
                 }
             }
-            BatchErr::PerIndex(errs) => {
-                let mut err_map: HashMap<u32, String> = errs.into_iter().collect();
+            BatchErr::PerIndex(mut errs) => {
+                // Per-index errors come in a short list (<= batch size), so a
+                // linear scan + swap_remove is cheaper than a HashMap.
                 for (offset, &i) in indices.iter().enumerate() {
-                    if let Some(msg) = err_map.remove(&(offset as u32)) {
-                        outcomes[i] = Outcome::Err(msg);
-                    } else {
-                        outcomes[i] = outcome_id(pending[i].id);
-                    }
+                    let offset_u32 = offset as u32;
+                    outcomes[i] = match errs.iter().position(|(idx, _)| *idx == offset_u32) {
+                        Some(pos) => Outcome::Err(errs.swap_remove(pos).1),
+                        None => outcome_id(pending[i].id),
+                    };
                 }
             }
         },
@@ -625,17 +636,31 @@ fn format_transfers_err(e: &tigerbeetle_unofficial::error::CreateTransfersError)
 }
 
 fn publish_outcomes(pending: Vec<Pending>, outcomes: Vec<Outcome>) -> Vec<usize> {
+    // Write pool entries for successful outcomes under RESULTS first, then
+    // flip state (plus error payloads, which live in Slot, not the pool)
+    // under RING. Order matters: the backend reads state under RING and the
+    // pool under RESULTS, so the pool must be settled before state=DONE is
+    // visible.
+    {
+        let mut pool = RESULTS.exclusive();
+        for (p, outcome) in pending.iter().zip(outcomes.iter()) {
+            if let Outcome::Ok { bytes, .. } = outcome {
+                let buf = &mut pool.bufs[p.slot_idx];
+                let n = bytes.len().min(RESULT_BUF_LEN);
+                buf[..n].copy_from_slice(&bytes[..n]);
+                if n < RESULT_BUF_LEN {
+                    buf[n..].fill(0);
+                }
+            }
+        }
+    }
+
     let mut latches = Vec::with_capacity(pending.len());
     let mut guard = RING.exclusive();
     for (p, outcome) in pending.into_iter().zip(outcomes) {
         let s = &mut guard.slots[p.slot_idx];
         match outcome {
-            Outcome::Ok { count, bytes } => {
-                let n = bytes.len().min(RESULT_BUF_LEN);
-                s.result_buf[..n].copy_from_slice(&bytes[..n]);
-                if n < RESULT_BUF_LEN {
-                    s.result_buf[n..].fill(0);
-                }
+            Outcome::Ok { count, .. } => {
                 s.result_count = count;
                 s.state = S_DONE;
             }

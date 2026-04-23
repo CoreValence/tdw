@@ -10,7 +10,7 @@ mod shmem;
 mod submit;
 mod worker;
 
-use shmem::{RING, Ring, WORKER_LATCH};
+use shmem::{RESULTS, RING, ResultPool, Ring, WORKER_LATCH};
 
 ::pgrx::pg_module_magic!(name, version);
 
@@ -19,6 +19,7 @@ pub extern "C-unwind" fn _PG_init() {
     guc::register();
 
     pg_shmem_init!(RING = Ring::empty());
+    pg_shmem_init!(RESULTS = ResultPool::empty());
     pg_shmem_init!(WORKER_LATCH = 0usize);
 
     BackgroundWorkerBuilder::new("beetle worker")

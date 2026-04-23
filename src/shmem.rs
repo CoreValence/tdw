@@ -1,17 +1,22 @@
 use pgrx::{PGRXSharedMemory, PgLwLock};
 
-// Slot (~2.3 KB with MAX_QUERY_ROWS=16) × CAPACITY lives in shmem. During
-// _PG_init, pg_shmem_init! builds the Ring by value on the postmaster stack
-// (twice, briefly, while wrapping into Shared<T>). 8 MB default stack bounds
-// this product at ~3 MB to leave headroom for pgrx/postgres frames.
-// Bursts above CAPACITY block on the session latch (see submit::submit_and_wait).
+// Per-slot result/leg buffer lives in ResultPool (a separate shmem segment),
+// keyed by slot index. Keeping it out of Slot shrinks the per-slot metadata
+// from ~2.3 KB to ~256 B, which (a) shortens the RING lwlock critical section
+// on state transitions, since the 2 KB memcpy now runs under RESULTS instead
+// of RING, and (b) lets CAPACITY grow without Slot-size pressure on the
+// backend stack at _PG_init — the two segments initialize independently and
+// pg_shmem_init!'s 2× stack tax applies to each on its own.
 pub(crate) const CAPACITY: usize = 1024;
 
 pub(crate) const S_EMPTY: u8 = 0;
-pub(crate) const S_PENDING: u8 = 1;
-pub(crate) const S_IN_FLIGHT: u8 = 2;
-pub(crate) const S_DONE: u8 = 3;
-pub(crate) const S_ERROR: u8 = 4;
+// Backend has claimed the slot and written metadata, but pool payload (if any)
+// is not yet written. Worker skips CLAIMED slots on drain.
+pub(crate) const S_CLAIMED: u8 = 1;
+pub(crate) const S_PENDING: u8 = 2;
+pub(crate) const S_IN_FLIGHT: u8 = 3;
+pub(crate) const S_DONE: u8 = 4;
+pub(crate) const S_ERROR: u8 = 5;
 
 pub(crate) const OP_NONE: u8 = 0;
 pub(crate) const OP_CREATE_ACCOUNT: u8 = 1;
@@ -23,32 +28,23 @@ pub(crate) const OP_GET_ACCOUNT_BALANCES: u8 = 6;
 pub(crate) const OP_QUERY_ACCOUNTS: u8 = 7;
 pub(crate) const OP_QUERY_TRANSFERS: u8 = 8;
 // Single-slot batch of N transfers. Worker unpacks up to MAX_BATCH_LEGS legs
-// from result_buf and submits them as a single client.create_transfers call,
-// so a LINKED chain stays atomic on the TB side.
+// from the slot's pool entry and submits them as a single create_transfers
+// call, so a LINKED chain stays atomic on the TB side.
 pub(crate) const OP_CREATE_TRANSFER_BATCH: u8 = 9;
 
 // All packed records are 128 bytes (RECORD_LEN) regardless of type.
 // Multi-row read responses carry up to MAX_QUERY_ROWS records, so the
-// per-slot result buffer is RECORD_LEN * MAX_QUERY_ROWS. Increasing
-// MAX_QUERY_ROWS grows the shmem segment by CAPACITY * RECORD_LEN bytes
-// per added row.
-//
-// Why: pg_shmem_init! constructs Ring by-value on the backend stack before
-// copying into shmem. With CAPACITY=1024 slots, each additional byte of Slot
-// costs 1 KB of transient stack; 64 rows × 128 B result_buf per slot pushed
-// total past the 8 MB default backend stack and segfaulted at _PG_init.
+// per-slot pool entry is RECORD_LEN * MAX_QUERY_ROWS.
 pub(crate) const RECORD_LEN: usize = 128;
 pub(crate) const MAX_QUERY_ROWS: u32 = 16;
 
 pub(crate) const ERR_BUF_LEN: usize = 128;
 pub(crate) const RESULT_BUF_LEN: usize = RECORD_LEN * MAX_QUERY_ROWS as usize;
 
-// OP_CREATE_TRANSFER_BATCH packs its legs into result_buf on the way in and
-// the worker overwrites it with the resulting ids on the way out (each id
-// padded to RECORD_LEN so ReadBack::record() can decode them at the same
-// stride as any other read). Cap is governed by the output side:
-// RESULT_BUF_LEN / RECORD_LEN = MAX_QUERY_ROWS. One batch call to TB keeps a
-// LINKED chain atomic.
+// OP_CREATE_TRANSFER_BATCH packs its legs into the slot's pool entry on the
+// way in and the worker overwrites it with the resulting ids on the way out
+// (each id padded to RECORD_LEN so ReadBack::record() can decode them at the
+// same stride as any other read).
 pub(crate) const BATCH_LEG_LEN: usize = 96;
 pub(crate) const MAX_BATCH_LEGS: usize = MAX_QUERY_ROWS as usize;
 
@@ -74,16 +70,16 @@ pub(crate) struct Slot {
     pub(crate) code: u16,
     pub(crate) flags: u32,
     // For reads: row limit.
-    // For CREATE_TRANSFER_BATCH: number of legs packed in result_buf.
+    // For CREATE_TRANSFER_BATCH: number of legs packed in the pool entry.
     pub(crate) limit: u32,
-    // For single-record writes: first 16 bytes hold the assigned id, result_count = 1.
-    // For single-row reads: one RECORD_LEN record, result_count = 1.
+    // For single-record writes: first 16 bytes of the pool entry hold the
+    //   assigned id, result_count = 1.
+    // For single-row reads: one RECORD_LEN record in the pool entry, result_count = 1.
     // For multi-row reads: result_count records packed back-to-back,
     //   each RECORD_LEN bytes (see pack::pack_account/pack_transfer/pack_balance).
     // For CREATE_TRANSFER_BATCH (input): `limit` legs of BATCH_LEG_LEN bytes each;
     //   (output): result_count ids of 16 bytes each packed at the start of the buf.
     pub(crate) result_count: u32,
-    pub(crate) result_buf: [u8; RESULT_BUF_LEN],
     pub(crate) error_len: u16,
     pub(crate) error_msg: [u8; ERR_BUF_LEN],
     pub(crate) session_latch: usize,
@@ -104,7 +100,6 @@ impl Slot {
             flags: 0,
             limit: 0,
             result_count: 0,
-            result_buf: [0; RESULT_BUF_LEN],
             error_len: 0,
             error_msg: [0; ERR_BUF_LEN],
             session_latch: 0,
@@ -128,7 +123,27 @@ impl Ring {
     }
 }
 
+// Per-slot payload pool. bufs[i] is owned by slot i for the duration of its
+// op. Splits the big memcpy out of the RING critical section so backends
+// claiming new slots don't wait behind the worker writing a 2 KB result.
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub(crate) struct ResultPool {
+    pub(crate) bufs: [[u8; RESULT_BUF_LEN]; CAPACITY],
+}
+
+impl ResultPool {
+    pub(crate) const fn empty() -> Self {
+        ResultPool {
+            bufs: [[0; RESULT_BUF_LEN]; CAPACITY],
+        }
+    }
+}
+
 unsafe impl PGRXSharedMemory for Ring {}
+unsafe impl PGRXSharedMemory for ResultPool {}
 
 pub(crate) static RING: PgLwLock<Ring> = unsafe { PgLwLock::new(c"beetle_ring") };
+pub(crate) static RESULTS: PgLwLock<ResultPool> =
+    unsafe { PgLwLock::new(c"beetle_results") };
 pub(crate) static WORKER_LATCH: PgLwLock<usize> = unsafe { PgLwLock::new(c"beetle_worker_latch") };
