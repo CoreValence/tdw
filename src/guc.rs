@@ -11,6 +11,14 @@ pub(crate) static BATCH_WAIT_MS: GucSetting<i32> = GucSetting::<i32>::new(1);
 
 pub(crate) static BATCH_MAX: GucSetting<i32> = GucSetting::<i32>::new(8189);
 
+pub(crate) static OTLP_ENDPOINT: GucSetting<Option<CString>> =
+    GucSetting::<Option<CString>>::new(None);
+
+pub(crate) static OTLP_SERVICE_NAME: GucSetting<Option<CString>> =
+    GucSetting::<Option<CString>>::new(Some(c"beetle"));
+
+pub(crate) static METRICS_INTERVAL_MS: GucSetting<i32> = GucSetting::<i32>::new(1000);
+
 pub(crate) fn register() {
     GucRegistry::define_string_guc(
         c"beetle.tb_addr",
@@ -49,6 +57,35 @@ pub(crate) fn register() {
         1,
         8189,
         GucContext::Sighup,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_string_guc(
+        c"beetle.otlp_endpoint",
+        c"OTLP gRPC endpoint for traces/metrics (e.g. http://localhost:4317). Empty disables.",
+        c"Endpoint is read at worker start; changes require a worker restart.",
+        &OTLP_ENDPOINT,
+        GucContext::Postmaster,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_string_guc(
+        c"beetle.otlp_service_name",
+        c"service.name resource attribute on exported telemetry.",
+        c"Shown as the service in Tempo/Jaeger/Grafana.",
+        &OTLP_SERVICE_NAME,
+        GucContext::Postmaster,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        c"beetle.metrics_interval_ms",
+        c"Metric export interval (ms).",
+        c"Worker pushes accumulated counters/histograms to the collector on this cadence.",
+        &METRICS_INTERVAL_MS,
+        100,
+        60_000,
+        GucContext::Postmaster,
         GucFlags::default(),
     );
 }

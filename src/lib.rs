@@ -5,11 +5,13 @@ use std::time::Duration;
 
 mod api;
 mod guc;
+mod obs;
 mod pack;
 mod shmem;
 mod submit;
 mod worker;
 
+use obs::{STATS, Stats};
 use shmem::{RESULTS, RING, ResultPool, Ring, WORKER_LATCH};
 
 ::pgrx::pg_module_magic!(name, version);
@@ -21,6 +23,7 @@ pub extern "C-unwind" fn _PG_init() {
     pg_shmem_init!(RING = Ring::empty());
     pg_shmem_init!(RESULTS = ResultPool::empty());
     pg_shmem_init!(WORKER_LATCH = 0usize);
+    pg_shmem_init!(STATS = Stats::new());
 
     BackgroundWorkerBuilder::new("beetle worker")
         .set_function("beetle_worker_main")

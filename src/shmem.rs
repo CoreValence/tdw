@@ -83,6 +83,10 @@ pub(crate) struct Slot {
     pub(crate) error_len: u16,
     pub(crate) error_msg: [u8; ERR_BUF_LEN],
     pub(crate) session_latch: usize,
+    // CLOCK_MONOTONIC ns at the moment the backend promoted the slot to
+    // S_PENDING. Worker computes pending_wait = now - pending_ns at drain
+    // time. Zero when the slot is not on the wire.
+    pub(crate) pending_ns: u64,
 }
 
 impl Slot {
@@ -103,6 +107,7 @@ impl Slot {
             error_len: 0,
             error_msg: [0; ERR_BUF_LEN],
             session_latch: 0,
+            pending_ns: 0,
         }
     }
 }
@@ -144,6 +149,5 @@ unsafe impl PGRXSharedMemory for Ring {}
 unsafe impl PGRXSharedMemory for ResultPool {}
 
 pub(crate) static RING: PgLwLock<Ring> = unsafe { PgLwLock::new(c"beetle_ring") };
-pub(crate) static RESULTS: PgLwLock<ResultPool> =
-    unsafe { PgLwLock::new(c"beetle_results") };
+pub(crate) static RESULTS: PgLwLock<ResultPool> = unsafe { PgLwLock::new(c"beetle_results") };
 pub(crate) static WORKER_LATCH: PgLwLock<usize> = unsafe { PgLwLock::new(c"beetle_worker_latch") };
