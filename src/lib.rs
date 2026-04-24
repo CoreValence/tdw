@@ -4,6 +4,7 @@ use pgrx::prelude::*;
 use std::time::Duration;
 
 mod api;
+mod fdw;
 mod guc;
 mod obs;
 mod pack;

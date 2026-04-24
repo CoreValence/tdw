@@ -19,6 +19,13 @@ pub(crate) static OTLP_SERVICE_NAME: GucSetting<Option<CString>> =
 
 pub(crate) static METRICS_INTERVAL_MS: GucSetting<i32> = GucSetting::<i32>::new(1000);
 
+// Row ceilings for the FDW's paginated multi-row scans. See drive_pagination
+// in fdw.rs: the first bounds an unlimited scan (no user LIMIT); the second
+// bounds even a user-supplied LIMIT. Both exist to keep an unfiltered scan
+// of a large TB cluster from draining unbounded rows into backend memory.
+pub(crate) static FDW_DEFAULT_SCAN_LIMIT: GucSetting<i32> = GucSetting::<i32>::new(1_000);
+pub(crate) static FDW_PAGINATION_CAP: GucSetting<i32> = GucSetting::<i32>::new(10_000);
+
 pub(crate) fn register() {
     GucRegistry::define_string_guc(
         c"beetle.tb_addr",
@@ -86,6 +93,28 @@ pub(crate) fn register() {
         100,
         60_000,
         GucContext::Postmaster,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        c"beetle.fdw_default_scan_limit",
+        c"Row ceiling for FDW scans that lack an explicit LIMIT clause.",
+        c"Applies to SELECT * FROM tb_* without LIMIT. Prevents an unfiltered scan on a large TB cluster from draining unbounded rows into backend memory. Raise to enumerate larger result sets; cap with beetle.fdw_pagination_cap. Per-session SET is allowed.",
+        &FDW_DEFAULT_SCAN_LIMIT,
+        1,
+        10_000_000,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        c"beetle.fdw_pagination_cap",
+        c"Hard ceiling on rows any single FDW scan will drain, even with an explicit LIMIT.",
+        c"User-supplied LIMIT is clamped to this value. Protects against typos like LIMIT 1000000 on a ledger with millions of rows. Per-session SET is allowed.",
+        &FDW_PAGINATION_CAP,
+        1,
+        10_000_000,
+        GucContext::Userset,
         GucFlags::default(),
     );
 }

@@ -6,7 +6,7 @@ use pgrx::prelude::*;
 use std::collections::HashMap;
 use std::net::ToSocketAddrs;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::guc::{BATCH_MAX, BATCH_WAIT_MS, TB_ADDR, TB_CLUSTER_ID};
 use crate::obs::{self, Instruments};
@@ -82,6 +82,8 @@ struct Pending {
     // CLOCK_MONOTONIC ns stamped by the backend at S_PENDING; diffed against
     // now() at drain to derive pending_wait.
     pending_ns: u64,
+    // Pagination cursor for multi-row reads; 0 means "first page". See Slot.
+    timestamp_min: u64,
     // OP_CREATE_TRANSFER_BATCH only: leg descriptors unpacked from result_buf.
     batch_legs: Vec<BatchLeg>,
 }
@@ -297,6 +299,7 @@ fn drain_pending() -> Vec<Pending> {
                     flags: s.flags,
                     limit: s.limit,
                     pending_ns: s.pending_ns,
+                    timestamp_min: s.timestamp_min,
                     batch_legs: Vec::new(),
                 });
                 if is_batch {
@@ -582,6 +585,12 @@ fn run_batch(
     outcomes
 }
 
+// TB filters take SystemTime; our shmem carries Unix-epoch nanoseconds
+// (the same encoding pack.rs emits in each record's timestamp field).
+fn ts_from_nanos(nanos: u64) -> SystemTime {
+    UNIX_EPOCH + Duration::from_nanos(nanos)
+}
+
 fn pack_records<T, F>(records: &[T], pack: F) -> (u32, Vec<u8>)
 where
     F: Fn(&T) -> [u8; RECORD_LEN],
@@ -600,10 +609,12 @@ fn run_account_transfers(
     p: &Pending,
 ) -> Outcome {
     let limit = p.limit.clamp(1, MAX_QUERY_ROWS);
-    let filter = Box::new(
-        tigerbeetle_unofficial::account::Filter::new(p.id, limit)
-            .with_flags(tigerbeetle_unofficial::account::FilterFlags::from_bits_retain(p.flags)),
-    );
+    let mut filter = tigerbeetle_unofficial::account::Filter::new(p.id, limit)
+        .with_flags(tigerbeetle_unofficial::account::FilterFlags::from_bits_retain(p.flags));
+    if p.timestamp_min != 0 {
+        filter.set_timestamp_min(ts_from_nanos(p.timestamp_min));
+    }
+    let filter = Box::new(filter);
     match rt.block_on(client.get_account_transfers(filter)) {
         Ok(v) => {
             let (count, bytes) = pack_records(&v, pack_transfer);
@@ -619,10 +630,12 @@ fn run_account_balances(
     p: &Pending,
 ) -> Outcome {
     let limit = p.limit.clamp(1, MAX_QUERY_ROWS);
-    let filter = Box::new(
-        tigerbeetle_unofficial::account::Filter::new(p.id, limit)
-            .with_flags(tigerbeetle_unofficial::account::FilterFlags::from_bits_retain(p.flags)),
-    );
+    let mut filter = tigerbeetle_unofficial::account::Filter::new(p.id, limit)
+        .with_flags(tigerbeetle_unofficial::account::FilterFlags::from_bits_retain(p.flags));
+    if p.timestamp_min != 0 {
+        filter.set_timestamp_min(ts_from_nanos(p.timestamp_min));
+    }
+    let filter = Box::new(filter);
     match rt.block_on(client.get_account_balances(filter)) {
         Ok(v) => {
             let (count, bytes) = pack_records(&v, pack_balance);
@@ -646,6 +659,9 @@ fn run_query_accounts(
     if p.code != 0 {
         filter.set_code(p.code);
     }
+    if p.timestamp_min != 0 {
+        filter.set_timestamp_min(ts_from_nanos(p.timestamp_min));
+    }
     match rt.block_on(client.query_accounts(Box::new(filter))) {
         Ok(v) => {
             let (count, bytes) = pack_records(&v, pack_account);
@@ -668,6 +684,9 @@ fn run_query_transfers(
     }
     if p.code != 0 {
         filter.set_code(p.code);
+    }
+    if p.timestamp_min != 0 {
+        filter.set_timestamp_min(ts_from_nanos(p.timestamp_min));
     }
     match rt.block_on(client.query_transfers(Box::new(filter))) {
         Ok(v) => {

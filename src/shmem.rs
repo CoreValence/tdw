@@ -87,6 +87,13 @@ pub(crate) struct Slot {
     // S_PENDING. Worker computes pending_wait = now - pending_ns at drain
     // time. Zero when the slot is not on the wire.
     pub(crate) pending_ns: u64,
+    // TB pagination cursor for multi-row reads (QUERY_*, GET_ACCOUNT_*):
+    // inclusive lower bound on TB timestamps. Zero means "no lower bound"
+    // (first page). On subsequent pages the backend sets it to
+    // last_returned_ts + 1, so a result set larger than MAX_QUERY_ROWS can
+    // be drained in multiple round-trips without exposing the per-slot cap.
+    // Unused by lookups and writes.
+    pub(crate) timestamp_min: u64,
 }
 
 impl Slot {
@@ -108,6 +115,7 @@ impl Slot {
             error_msg: [0; ERR_BUF_LEN],
             session_latch: 0,
             pending_ns: 0,
+            timestamp_min: 0,
         }
     }
 }
