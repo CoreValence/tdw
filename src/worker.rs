@@ -1,15 +1,11 @@
-use opentelemetry::Context;
-use opentelemetry::KeyValue;
-use opentelemetry::trace::{Span, TraceContextExt, Tracer};
 use pgrx::bgworkers::{BackgroundWorker, SignalWakeFlags};
 use pgrx::prelude::*;
 use std::collections::HashMap;
 use std::net::ToSocketAddrs;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::guc::{BATCH_MAX, BATCH_WAIT_MS, TB_ADDR, TB_CLUSTER_ID};
-use crate::obs::{self, Instruments};
 use crate::pack::{pack_account, pack_balance, pack_transfer};
 use crate::shmem::{
     BATCH_LEG_LEN, CAPACITY, ERR_BUF_LEN, MAX_BATCH_LEGS, MAX_QUERY_ROWS, OP_CREATE_ACCOUNT,
@@ -79,9 +75,6 @@ struct Pending {
     code: u16,
     flags: u32,
     limit: u32,
-    // CLOCK_MONOTONIC ns stamped by the backend at S_PENDING; diffed against
-    // now() at drain to derive pending_wait.
-    pending_ns: u64,
     // Pagination cursor for multi-row reads; 0 means "first page". See Slot.
     timestamp_min: u64,
     // OP_CREATE_TRANSFER_BATCH only: leg descriptors unpacked from result_buf.
@@ -185,10 +178,6 @@ pub extern "C-unwind" fn beetle_worker_main(_arg: pg_sys::Datum) {
         Err(e) => error!("beetle: failed to connect to TigerBeetle: {}", e),
     };
 
-    // Initialize OTLP exporters inside rt.block_on so tonic sees a reactor.
-    // No-op if beetle.otlp_endpoint is empty.
-    obs::init(&rt);
-
     // Install our own SIGTERM handler AFTER Client::new. pgrx's
     // attach_signal_handlers is insufficient because TB's Zig runtime blocks
     // SIGTERM on every thread it touches; checking pgrx's flag stays false
@@ -207,48 +196,8 @@ pub extern "C-unwind" fn beetle_worker_main(_arg: pg_sys::Datum) {
 
         let pending = drain_pending();
         if !pending.is_empty() {
-            let inst = obs::instruments();
-
-            // Drain-time metrics: pending_wait per slot, submit_count per op,
-            // drain_size, plus refresh the occupancy gauge. Done before the
-            // TB calls so the histograms reflect queue wait, not TB cost.
-            let drain_cx = inst.map(|i| {
-                let now = obs::now_monotonic_ns();
-                for p in &pending {
-                    let wait_ns = now.saturating_sub(p.pending_ns);
-                    i.pending_wait_ms.record(
-                        wait_ns as f64 / 1_000_000.0,
-                        &[KeyValue::new("op", obs::op_label(p.op))],
-                    );
-                    i.submit_count
-                        .add(1, &[KeyValue::new("op", obs::op_label(p.op))]);
-                }
-                i.drain_size.record(pending.len() as u64, &[]);
-                let (occ_p, occ_f) = count_occupancy();
-                obs::set_occupancy(occ_p, occ_f);
-
-                let mut span = i.tracer.start("worker.drain");
-                span.set_attribute(KeyValue::new("drain.size", pending.len() as i64));
-                Context::current_with_span(span)
-            });
-            // Attach drain_cx as current context so TB-call child spans parent
-            // off it. Cloned because drain_cx itself is needed later to call
-            // .span().end().
-            let _attach = drain_cx.as_ref().map(|cx| cx.clone().attach());
-
-            let outcomes = run_batch(&rt, &client, &pending, inst);
-
-            let publish_start = Instant::now();
-            let latches = publish_outcomes(pending, outcomes, inst);
-            if let Some(i) = inst {
-                i.publish_ms
-                    .record(publish_start.elapsed().as_secs_f64() * 1000.0, &[]);
-            }
-
-            drop(_attach);
-            if let Some(cx) = drain_cx {
-                cx.span().end();
-            }
+            let outcomes = run_batch(&rt, &client, &pending);
+            let latches = publish_outcomes(pending, outcomes);
 
             for latch in latches {
                 unsafe {
@@ -298,7 +247,6 @@ fn drain_pending() -> Vec<Pending> {
                     code: s.code,
                     flags: s.flags,
                     limit: s.limit,
-                    pending_ns: s.pending_ns,
                     timestamp_min: s.timestamp_min,
                     batch_legs: Vec::new(),
                 });
@@ -326,46 +274,6 @@ fn drain_pending() -> Vec<Pending> {
     out
 }
 
-// Observable-gauge callback reads occupancy from worker-local statics rather
-// than re-taking RING from the export thread; the worker refreshes those
-// statics each drain by calling us under RING.share().
-fn count_occupancy() -> (u64, u64) {
-    let guard = RING.share();
-    let mut pending = 0u64;
-    let mut in_flight = 0u64;
-    for s in &guard.slots {
-        match s.state {
-            S_PENDING => pending += 1,
-            S_IN_FLIGHT => in_flight += 1,
-            _ => {}
-        }
-    }
-    (pending, in_flight)
-}
-
-// Wrap one TB call group in a child span (parented off worker.drain via the
-// attached context) plus a tb_call_ms histogram entry. No-op when telemetry
-// is disabled.
-fn time_tb<T>(
-    inst: Option<&'static Instruments>,
-    op_label: &'static str,
-    f: impl FnOnce() -> T,
-) -> T {
-    let start = Instant::now();
-    let mut span = inst.map(|i| i.tracer.start(format!("tb.{op_label}")));
-    let out = f();
-    if let Some(s) = span.as_mut() {
-        s.end();
-    }
-    if let Some(i) = inst {
-        i.tb_call_ms.record(
-            start.elapsed().as_secs_f64() * 1000.0,
-            &[KeyValue::new("op", op_label)],
-        );
-    }
-    out
-}
-
 fn unpack_batch_leg(buf: &[u8; RESULT_BUF_LEN], idx: usize) -> BatchLeg {
     let o = idx * BATCH_LEG_LEN;
     BatchLeg {
@@ -384,7 +292,6 @@ fn run_batch(
     rt: &tokio::runtime::Runtime,
     client: &tigerbeetle_unofficial::Client,
     pending: &[Pending],
-    inst: Option<&'static Instruments>,
 ) -> Vec<Outcome> {
     let mut outcomes: Vec<Outcome> = (0..pending.len())
         .map(|_| Outcome::Err("not processed".into()))
@@ -414,9 +321,7 @@ fn run_batch(
                 )
             })
             .collect();
-        let res = time_tb(inst, "create_accounts", || {
-            rt.block_on(client.create_accounts(accounts))
-        });
+        let res = rt.block_on(client.create_accounts(accounts));
         apply_batch_ids(
             &account_idx,
             pending,
@@ -446,9 +351,7 @@ fn run_batch(
                 t
             })
             .collect();
-        let res = time_tb(inst, "create_transfers", || {
-            rt.block_on(client.create_transfers(transfers))
-        });
+        let res = rt.block_on(client.create_transfers(transfers));
         apply_batch_ids(
             &transfer_idx,
             pending,
@@ -486,9 +389,7 @@ fn run_batch(
                 t
             })
             .collect();
-        outcomes[i] = match time_tb(inst, "create_transfer_batch", || {
-            rt.block_on(client.create_transfers(transfers))
-        }) {
+        outcomes[i] = match rt.block_on(client.create_transfers(transfers)) {
             Ok(()) => {
                 let ids: Vec<u128> = p.batch_legs.iter().map(|leg| leg.id).collect();
                 outcome_ids(&ids)
@@ -512,9 +413,7 @@ fn run_batch(
 
     if !lookup_account_idx.is_empty() {
         let ids: Vec<u128> = lookup_account_idx.iter().map(|&i| pending[i].id).collect();
-        match time_tb(inst, "lookup_accounts", || {
-            rt.block_on(client.lookup_accounts(ids))
-        }) {
+        match rt.block_on(client.lookup_accounts(ids)) {
             Ok(found) => {
                 let by_id: HashMap<u128, tigerbeetle_unofficial::Account> =
                     found.into_iter().map(|a| (a.id(), a)).collect();
@@ -535,9 +434,7 @@ fn run_batch(
 
     if !lookup_transfer_idx.is_empty() {
         let ids: Vec<u128> = lookup_transfer_idx.iter().map(|&i| pending[i].id).collect();
-        match time_tb(inst, "lookup_transfers", || {
-            rt.block_on(client.lookup_transfers(ids))
-        }) {
+        match rt.block_on(client.lookup_transfers(ids)) {
             Ok(found) => {
                 let by_id: HashMap<u128, tigerbeetle_unofficial::Transfer> =
                     found.into_iter().map(|t| (t.id(), t)).collect();
@@ -561,22 +458,16 @@ fn run_batch(
     for (i, p) in pending.iter().enumerate() {
         match p.op {
             OP_GET_ACCOUNT_TRANSFERS => {
-                outcomes[i] = time_tb(inst, "get_account_transfers", || {
-                    run_account_transfers(rt, client, p)
-                });
+                outcomes[i] = run_account_transfers(rt, client, p);
             }
             OP_GET_ACCOUNT_BALANCES => {
-                outcomes[i] = time_tb(inst, "get_account_balances", || {
-                    run_account_balances(rt, client, p)
-                });
+                outcomes[i] = run_account_balances(rt, client, p);
             }
             OP_QUERY_ACCOUNTS => {
-                outcomes[i] = time_tb(inst, "query_accounts", || run_query_accounts(rt, client, p));
+                outcomes[i] = run_query_accounts(rt, client, p);
             }
             OP_QUERY_TRANSFERS => {
-                outcomes[i] = time_tb(inst, "query_transfers", || {
-                    run_query_transfers(rt, client, p)
-                });
+                outcomes[i] = run_query_transfers(rt, client, p);
             }
             _ => {}
         }
@@ -761,22 +652,7 @@ fn format_transfers_err(e: &tigerbeetle_unofficial::error::CreateTransfersError)
     }
 }
 
-fn publish_outcomes(
-    pending: Vec<Pending>,
-    outcomes: Vec<Outcome>,
-    inst: Option<&'static Instruments>,
-) -> Vec<usize> {
-    // Bump submit_errors before taking any locks; outcomes are owned here so
-    // this is just a read over the vec.
-    if let Some(i) = inst {
-        for (p, outcome) in pending.iter().zip(outcomes.iter()) {
-            if matches!(outcome, Outcome::Err(_)) {
-                i.submit_errors
-                    .add(1, &[KeyValue::new("op", obs::op_label(p.op))]);
-            }
-        }
-    }
-
+fn publish_outcomes(pending: Vec<Pending>, outcomes: Vec<Outcome>) -> Vec<usize> {
     // Write pool entries for successful outcomes under RESULTS first, then
     // flip state (plus error payloads, which live in Slot, not the pool)
     // under RING. Order matters: the backend reads state under RING and the

@@ -23,9 +23,6 @@ pg18    = ["pgrx/pg18"]
 
 [dependencies]
 libc                   = { version = "0.2" }
-opentelemetry          = { version = "0.31" }
-opentelemetry-otlp     = { version = "0.31", default-features = false, features = ["grpc-tonic", "metrics", "tls", "tls-webpki-roots", "trace"] }
-opentelemetry_sdk      = { version = "0.31", features = ["experimental_metrics_periodicreader_with_async_runtime", "experimental_trace_batch_span_processor_with_async_runtime", "metrics", "rt-tokio-current-thread", "trace"] }
 pgrx                   = { version = "=0.18.0" }
 serde_json             = { version = "1" }
 tigerbeetle-unofficial = { version = "0.14" }

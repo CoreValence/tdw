@@ -1,7 +1,5 @@
 use pgrx::prelude::*;
-use std::sync::atomic::Ordering;
 
-use crate::obs::{STATS, now_monotonic_ns};
 use crate::shmem::{
     CAPACITY, RECORD_LEN, RESULT_BUF_LEN, RESULTS, RING, S_CLAIMED, S_DONE, S_EMPTY, S_ERROR,
     S_PENDING, Slot, WORKER_LATCH,
@@ -57,7 +55,6 @@ where
     // fill_meta is FnOnce; Option<...>.take() moves it out on the one iteration
     // that acquires a slot.
     let mut fill_meta_opt = Some(fill_meta);
-    let mut ring_full_counted = false;
     let slot_idx = loop {
         let chosen = {
             let mut guard = RING.exclusive();
@@ -88,13 +85,6 @@ where
             break i;
         }
 
-        // Count only the first miss on this call, not every wakeup of the
-        // retry loop — one op waiting ten iterations is still one ring-full.
-        if !ring_full_counted {
-            STATS.get().ring_full_blocks.fetch_add(1, Ordering::Relaxed);
-            ring_full_counted = true;
-        }
-
         check_for_interrupts!();
         unsafe {
             let wl = pg_sys::WaitLatch(
@@ -119,7 +109,6 @@ where
     // Publish the slot to the worker.
     {
         let mut guard = RING.exclusive();
-        guard.slots[slot_idx].pending_ns = now_monotonic_ns();
         guard.slots[slot_idx].state = S_PENDING;
     }
 
