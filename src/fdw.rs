@@ -484,11 +484,10 @@ unsafe fn classify_clause_field(node: *mut pg_sys::Node, kind: TableKind) -> Opt
 unsafe extern "C-unwind" fn get_foreign_paths(
     root: *mut pg_sys::PlannerInfo,
     baserel: *mut pg_sys::RelOptInfo,
-    _ftable_oid: pg_sys::Oid,
+    ftable_oid: pg_sys::Oid,
 ) {
     unsafe {
-        // Single unparameterized path. No sort keys (TB returns in its own
-        // ordering), no lateral params, no outer/inner.
+        // Unparameterized path. No sort keys (TB returns in its own ordering).
         let startup_cost = 100.0;
         let total_cost = startup_cost + 10.0 * (*baserel).rows;
         let path = pg_sys::create_foreignscan_path(
@@ -506,6 +505,168 @@ unsafe extern "C-unwind" fn get_foreign_paths(
             std::ptr::null_mut(),
         );
         pg_sys::add_path(baserel, path as *mut pg_sys::Path);
+
+        // Parameterized paths for correlated joins. Without these the planner
+        // treats `JOIN tb_transfers ON t.debit_account_id = u.account_uuid` as
+        // a full-scan-then-hash-join — with our 10k pagination cap, that
+        // silently truncates. Parameterized paths tell the planner it can do
+        // an index-nested-loop shape where each outer row drives a TB lookup.
+        if let Some(kind) = table_kind_from_oid(ftable_oid) {
+            add_parameterized_paths(root, baserel, kind);
+        }
+    }
+}
+
+// Find join clauses of shape `our-Var = outer-Var` on our pushable columns
+// and emit one parameterized ForeignPath per outer relation set.
+//
+// PG strips simple equality joins from baserel->joininfo and re-derives them
+// from EquivalenceClasses, so a direct joininfo walk turns up empty for the
+// common `JOIN ON a.x = b.y` case. generate_implied_equalities_for_column is
+// the supported way back into the EC machinery: it returns RestrictInfos
+// representing every implied `our-col = some-other-col` equality. We call it
+// once per pushable column and group the results by outer relids.
+unsafe fn add_parameterized_paths(
+    root: *mut pg_sys::PlannerInfo,
+    baserel: *mut pg_sys::RelOptInfo,
+    kind: TableKind,
+) {
+    unsafe {
+        let relids = (*baserel).relids;
+
+        struct Group {
+            outer_relids: *mut pg_sys::Bitmapset,
+            clauses: *mut pg_sys::List,
+            best_field: QualField,
+        }
+        let mut groups: Vec<Group> = Vec::new();
+
+        // For each pushable column on this kind, ask PG for implied
+        // equalities involving that column. The callback identifies whether
+        // a given EquivalenceMember is the column we're asking about.
+        for &(attno, field) in pushable_columns(kind) {
+            let mut ctx = MatchCtx { attno };
+            let ris = pg_sys::generate_implied_equalities_for_column(
+                root,
+                baserel,
+                Some(ec_match_attno),
+                &mut ctx as *mut MatchCtx as *mut c_void,
+                std::ptr::null_mut(),
+            );
+            if ris.is_null() {
+                continue;
+            }
+            let n = (*ris).length as usize;
+            let cells = (*ris).elements;
+            for i in 0..n {
+                let ri = (*cells.add(i)).ptr_value as *mut pg_sys::RestrictInfo;
+                if ri.is_null() {
+                    continue;
+                }
+                let required = (*ri).required_relids;
+                let outer = pg_sys::bms_difference(required, relids);
+                if outer.is_null() || pg_sys::bms_num_members(outer) == 0 {
+                    continue;
+                }
+                let existing = groups
+                    .iter_mut()
+                    .find(|g| pg_sys::bms_equal(g.outer_relids, outer));
+                match existing {
+                    Some(g) => {
+                        g.clauses = pg_sys::lappend(g.clauses, ri as *mut c_void);
+                        if matches!(field, QualField::Id) {
+                            g.best_field = QualField::Id;
+                        }
+                    }
+                    None => {
+                        let mut clauses: *mut pg_sys::List = std::ptr::null_mut();
+                        clauses = pg_sys::lappend(clauses, ri as *mut c_void);
+                        groups.push(Group {
+                            outer_relids: outer,
+                            clauses,
+                            best_field: field,
+                        });
+                    }
+                }
+            }
+        }
+
+        for g in &groups {
+            let rows = match g.best_field {
+                QualField::Id => 1.0,
+                QualField::DebitAccountId | QualField::CreditAccountId => 50.0,
+                _ => 100.0,
+            };
+            let startup_cost = 100.0;
+            let total_cost = startup_cost + 10.0 * rows;
+            let path = pg_sys::create_foreignscan_path(
+                root,
+                baserel,
+                std::ptr::null_mut(),
+                rows,
+                0,
+                startup_cost,
+                total_cost,
+                std::ptr::null_mut(),
+                g.outer_relids,
+                std::ptr::null_mut(),
+                g.clauses,
+                std::ptr::null_mut(),
+            );
+            pg_sys::add_path(baserel, path as *mut pg_sys::Path);
+        }
+    }
+}
+
+#[repr(C)]
+struct MatchCtx {
+    attno: i16,
+}
+
+// EC callback: return true if this EquivalenceMember is the (Var on baserel
+// at attnum=ctx.attno) we're hunting for. PG iterates EM's looking for a
+// match; once found, it walks the rest of the EC and returns one RestrictInfo
+// per (matched-EM = other-EM-with-disjoint-relids) pair.
+unsafe extern "C-unwind" fn ec_match_attno(
+    _root: *mut pg_sys::PlannerInfo,
+    rel: *mut pg_sys::RelOptInfo,
+    _ec: *mut pg_sys::EquivalenceClass,
+    em: *mut pg_sys::EquivalenceMember,
+    arg: *mut c_void,
+) -> bool {
+    unsafe {
+        let ctx = &*(arg as *const MatchCtx);
+        let expr = (*em).em_expr as *mut pg_sys::Node;
+        if expr.is_null() || (*expr).type_ != pg_sys::NodeTag::T_Var {
+            return false;
+        }
+        let v = expr as *mut pg_sys::Var;
+        if !pg_sys::bms_is_member((*v).varno as i32, (*rel).relids) {
+            return false;
+        }
+        (*v).varattno == ctx.attno
+    }
+}
+
+// Pushable (attno, field) tuples per table kind. Mirrors field_info but
+// indexed by table for the EC walk above.
+fn pushable_columns(kind: TableKind) -> &'static [(i16, QualField)] {
+    match kind {
+        TableKind::Accounts => &[
+            (attr::accounts::ID, QualField::Id),
+            (attr::accounts::LEDGER, QualField::Ledger),
+            (attr::accounts::CODE, QualField::Code),
+            (attr::accounts::FLAGS, QualField::Flags),
+        ],
+        TableKind::Transfers => &[
+            (attr::transfers::ID, QualField::Id),
+            (attr::transfers::DEBIT_ACCOUNT_ID, QualField::DebitAccountId),
+            (attr::transfers::CREDIT_ACCOUNT_ID, QualField::CreditAccountId),
+            (attr::transfers::LEDGER, QualField::Ledger),
+            (attr::transfers::CODE, QualField::Code),
+            (attr::transfers::FLAGS, QualField::Flags),
+        ],
+        TableKind::Balances => &[(attr::balances::ACCOUNT_ID, QualField::Id)],
     }
 }
 
@@ -525,11 +686,14 @@ unsafe extern "C-unwind" fn get_foreign_plan(
         });
 
         // Extract pushable equalities from scan_clauses. Const RHS values land
-        // in `pushed` directly; Param RHS goes into fdw_exprs with an entry in
-        // param_map so begin_foreign_scan can evaluate and patch `pushed` at
-        // execute time. extract_actual_clauses(_, false) strips pseudoconstants.
+        // in `pushed` directly; Param RHS and outer-relation Var RHS (the
+        // latter present on parameterized paths used in nested loops) go into
+        // fdw_exprs with an entry in param_map so begin_foreign_scan can
+        // evaluate and patch `pushed` at execute time. Outer Vars get
+        // rewritten to PARAM_EXEC by PG's replace_nestloop_params before exec,
+        // so the runtime path is identical to plain prepared-statement Params.
         let actual = pg_sys::extract_actual_clauses(scan_clauses, false);
-        let (pushed, param_map, fdw_exprs, remaining) = split_clauses(actual, kind);
+        let (pushed, param_map, fdw_exprs, remaining) = split_clauses(actual, kind, baserel);
 
         // Stash quals, table kind, and param map in fdw_private so execution
         // can rebuild them (including after plan-cache deserialization).
@@ -548,15 +712,17 @@ unsafe extern "C-unwind" fn get_foreign_plan(
     }
 }
 
-// Walk the clause list, pulling out `Var = Const/Param` equalities on our
-// columns. Const RHS values are resolved straight into PushedQuals. Param RHS
-// is stashed in fdw_exprs (so the node survives plan caching) and recorded in
-// param_map as (field, expr_idx); begin_foreign_scan evaluates them into
-// PushedQuals at execution time. This is what makes prepared statements keep
-// pushdown instead of falling through to the unfiltered QUERY_* path.
+// Walk the clause list, pulling out `Var = Const/Param/OuterVar` equalities on
+// our columns. Const RHS values are resolved straight into PushedQuals. Param
+// RHS and outer-relation-Var RHS (on parameterized paths) go into fdw_exprs
+// with an entry in param_map; begin_foreign_scan evaluates them at execute
+// time. Outer Vars are swapped to PARAM_EXEC by PG's replace_nestloop_params
+// before execute, so runtime evaluation is identical to prepared-statement
+// Params — that's what makes correlated / LATERAL joins push down.
 unsafe fn split_clauses(
     clauses: *mut pg_sys::List,
     kind: TableKind,
+    baserel: *mut pg_sys::RelOptInfo,
 ) -> (PushedQuals, Vec<(QualField, i32)>, *mut pg_sys::List, *mut pg_sys::List) {
     let mut pushed = PushedQuals::default();
     let mut param_map: Vec<(QualField, i32)> = Vec::new();
@@ -571,7 +737,7 @@ unsafe fn split_clauses(
         let cells = (*clauses).elements;
         for i in 0..nelems {
             let node = (*cells.add(i)).ptr_value as *mut pg_sys::Node;
-            if try_push_clause(node, kind, &mut pushed, &mut param_map, &mut fdw_exprs) {
+            if try_push_clause(node, kind, baserel, &mut pushed, &mut param_map, &mut fdw_exprs) {
                 continue;
             }
             leftover = pg_sys::lappend(leftover, node as *mut c_void);
@@ -581,11 +747,13 @@ unsafe fn split_clauses(
 }
 
 // Returns true if the clause was consumed. OpExpr with equality over
-// (Var, Const|Param). Anything else — function calls, casts, non-equality
-// operators, subquery-returning Params wrapped in SubPlan — is left for Pg.
+// (our-Var, Const|Param|outer-Var). Anything else — function calls, casts,
+// non-equality operators, subquery-returning Params wrapped in SubPlan —
+// is left for Pg.
 unsafe fn try_push_clause(
     node: *mut pg_sys::Node,
     kind: TableKind,
+    baserel: *mut pg_sys::RelOptInfo,
     out: &mut PushedQuals,
     param_map: &mut Vec<(QualField, i32)>,
     fdw_exprs: &mut *mut pg_sys::List,
@@ -613,12 +781,23 @@ unsafe fn try_push_clause(
         let a0 = (*(*args).elements.add(0)).ptr_value as *mut pg_sys::Node;
         let a1 = (*(*args).elements.add(1)).ptr_value as *mut pg_sys::Node;
 
-        // One side must be a Var on our relation; the other a Const or Param
-        // of the matching type. Accept either order.
-        let (var, other) = if node_is_var(a0) {
-            (a0 as *mut pg_sys::Var, a1)
-        } else if node_is_var(a1) {
-            (a1 as *mut pg_sys::Var, a0)
+        // Identify our-Var side: a Var whose varno belongs to this baserel.
+        let relids = (*baserel).relids;
+        let is_our_var = |n: *mut pg_sys::Node| -> Option<*mut pg_sys::Var> {
+            if !node_is_var(n) {
+                return None;
+            }
+            let v = n as *mut pg_sys::Var;
+            if pg_sys::bms_is_member((*v).varno as i32, relids) {
+                Some(v)
+            } else {
+                None
+            }
+        };
+        let (var, other) = if let Some(v) = is_our_var(a0) {
+            (v, a1)
+        } else if let Some(v) = is_our_var(a1) {
+            (v, a0)
         } else {
             return false;
         };
@@ -645,7 +824,34 @@ unsafe fn try_push_clause(
             param_map.push((field, idx));
             return true;
         }
+        // Outer-relation Var: valid driver for a parameterized path. PG will
+        // rewrite it to PARAM_EXEC as part of the nested-loop plan before we
+        // execute, so our ExecInitExprList + ExecEvalExpr pipeline handles it
+        // exactly like a prepared-statement Param.
+        if node_is_var(other) {
+            let v = other as *mut pg_sys::Var;
+            if pg_sys::bms_is_member((*v).varno as i32, relids) {
+                // Self-Var on our rel — not a pushable join driver.
+                return false;
+            }
+            if !var_type_matches(v, ty) {
+                return false;
+            }
+            *fdw_exprs = pg_sys::lappend(*fdw_exprs, other as *mut c_void);
+            let idx = (*(*fdw_exprs)).length - 1;
+            param_map.push((field, idx));
+            return true;
+        }
         false
+    }
+}
+
+unsafe fn var_type_matches(var: *mut pg_sys::Var, ty: PgType) -> bool {
+    unsafe {
+        match ty {
+            PgType::Uuid => (*var).vartype == pg_sys::UUIDOID,
+            PgType::Int4 => (*var).vartype == pg_sys::INT4OID,
+        }
     }
 }
 
