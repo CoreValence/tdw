@@ -18,7 +18,7 @@ RUN --mount=type=cache,target=/var/cache/apt,id=apt-${TARGETARCH} \
     --mount=type=cache,target=/var/lib/apt,id=apt-lib-${TARGETARCH} \
     apt-get update && apt-get install -y --no-install-recommends \
         curl ca-certificates gnupg lsb-release build-essential \
-        libssl-dev libclang-dev pkg-config clang git \
+        libssl-dev libclang-dev pkg-config clang git xz-utils \
   && curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
      | gpg --dearmor -o /etc/apt/trusted.gpg.d/postgresql.gpg \
   && echo "deb http://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" \
@@ -27,6 +27,22 @@ RUN --mount=type=cache,target=/var/cache/apt,id=apt-${TARGETARCH} \
         postgresql-server-dev-18
 
 ENV PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config
+
+# Install Zig 0.14.1 and export ZIG_PATH so tigerbeetle-unofficial-sys's
+# build.rs uses it directly instead of trying to download Zig itself (the
+# auto-download path fails in network-restricted build sandboxes).
+ARG ZIG_VERSION=0.14.1
+RUN set -eux; \
+    case "${TARGETARCH}" in \
+        amd64)  ZIG_ARCH=x86_64 ;; \
+        arm64)  ZIG_ARCH=aarch64 ;; \
+        *) echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-${ZIG_ARCH}-linux-${ZIG_VERSION}.tar.xz" \
+        | tar -xJ -C /opt; \
+    mv "/opt/zig-${ZIG_ARCH}-linux-${ZIG_VERSION}" /opt/zig
+ENV ZIG_PATH=/opt/zig/zig
+ENV PATH=/opt/zig:$PATH
 
 # pgrx cli pinned to match [dependencies].
 RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-${TARGETARCH} \
