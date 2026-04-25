@@ -310,4 +310,4 @@ The CI matrix in `.github/workflows/release.yml` builds `pg15..pg18 × {amd64, a
 
 ## License
 
-TBD.
+[Apache-2.0 license](LICENSE).
