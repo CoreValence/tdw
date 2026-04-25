@@ -3,7 +3,7 @@ use pgrx::prelude::*;
 use std::collections::HashMap;
 use std::net::ToSocketAddrs;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::guc::{BATCH_MAX, BATCH_WAIT_MS, TB_ADDR, TB_CLUSTER_ID};
 use crate::pack::{pack_account, pack_balance, pack_transfer};
@@ -11,8 +11,8 @@ use crate::shmem::{
     BATCH_LEG_LEN, CAPACITY, ERR_BUF_LEN, MAX_BATCH_LEGS, MAX_QUERY_ROWS, OP_CREATE_ACCOUNT,
     OP_CREATE_TRANSFER, OP_CREATE_TRANSFER_BATCH, OP_GET_ACCOUNT_BALANCES,
     OP_GET_ACCOUNT_TRANSFERS, OP_LOOKUP_ACCOUNT, OP_LOOKUP_TRANSFER, OP_QUERY_ACCOUNTS,
-    OP_QUERY_TRANSFERS, RECORD_LEN, RESULT_BUF_LEN, RESULTS, RING, S_DONE, S_ERROR, S_IN_FLIGHT,
-    S_PENDING, WORKER_LATCH,
+    OP_QUERY_TRANSFERS, RECORD_LEN, RESULT_BUF_LEN, RESULTS, RING, S_CLAIMED, S_DONE, S_ERROR,
+    S_IN_FLIGHT, S_PENDING, Slot, WORKER_LATCH,
 };
 
 // pgrx's attach_signal_handlers gets clobbered because TB's Zig runtime sets
@@ -187,6 +187,14 @@ pub extern "C-unwind" fn tbw_worker_main(_arg: pg_sys::Datum) {
 
     log!("tbw: worker ready (capacity={})", CAPACITY);
 
+    // If a previous worker died mid-flight, any S_IN_FLIGHT slots have no one
+    // to publish their results. Mark them with a "worker restarted" error so
+    // the waiting backends wake up instead of spinning on a 500ms latch wait
+    // forever.
+    recover_after_restart();
+
+    let mut last_reap = Instant::now();
+
     loop {
         if GOT_SIGTERM.load(Ordering::SeqCst) {
             log!("tbw: sigterm observed");
@@ -195,7 +203,8 @@ pub extern "C-unwind" fn tbw_worker_main(_arg: pg_sys::Datum) {
         let _ = BackgroundWorker::sighup_received();
 
         let pending = drain_pending();
-        if !pending.is_empty() {
+        let had_work = !pending.is_empty();
+        if had_work {
             let outcomes = run_batch(&rt, &client, &pending);
             let latches = publish_outcomes(pending, outcomes);
 
@@ -204,10 +213,20 @@ pub extern "C-unwind" fn tbw_worker_main(_arg: pg_sys::Datum) {
                     pg_sys::SetLatch(latch as *mut pg_sys::Latch);
                 }
             }
-            continue;
         }
 
-        BackgroundWorker::wait_latch(Some(Duration::from_millis(BATCH_WAIT_MS.get() as u64)));
+        // Reap orphaned slots periodically. Backends that died between claim
+        // and reading the result leave their slot stuck in S_CLAIMED, S_DONE,
+        // or S_ERROR forever; without this, the ring eventually fills with
+        // ghosts. 5s is a generous threshold compared to any normal op.
+        if last_reap.elapsed() > Duration::from_secs(5) {
+            reap_orphaned_slots();
+            last_reap = Instant::now();
+        }
+
+        if !had_work {
+            BackgroundWorker::wait_latch(Some(Duration::from_millis(BATCH_WAIT_MS.get() as u64)));
+        }
     }
 
     log!("tbw: worker exiting");
@@ -217,6 +236,94 @@ pub extern "C-unwind" fn tbw_worker_main(_arg: pg_sys::Datum) {
     std::mem::forget(client);
     std::mem::forget(rt);
     std::process::exit(0);
+}
+
+// On worker startup, fail any S_IN_FLIGHT slots from the previous incarnation.
+// They were mid-TB-call when the prior worker died; their backends are still
+// (potentially) waiting for a result that will never come. Mark them with a
+// terminal error so the backends wake and surface the failure to the caller,
+// who can decide whether to retry. The TB-side outcome is unknown (op may or
+// may not have committed); the error message says so.
+fn recover_after_restart() {
+    let msg = b"tbw: worker restarted mid-flight; outcome unknown, retry idempotent";
+    let mut latches = Vec::new();
+    {
+        let mut guard = RING.exclusive();
+        for i in 0..CAPACITY {
+            let s = &mut guard.slots[i];
+            if s.state == S_IN_FLIGHT {
+                let n = msg.len().min(ERR_BUF_LEN);
+                s.error_msg[..n].copy_from_slice(&msg[..n]);
+                s.error_len = n as u16;
+                s.state = S_ERROR;
+                if s.session_latch != 0 {
+                    latches.push(s.session_latch);
+                }
+            }
+        }
+    }
+    if !latches.is_empty() {
+        log!(
+            "tbw: recover_after_restart: marked {} stuck IN_FLIGHT slot(s) as ERROR",
+            latches.len()
+        );
+        for latch in latches {
+            unsafe { pg_sys::SetLatch(latch as *mut pg_sys::Latch) };
+        }
+    }
+}
+
+// Reset slots whose owning backend is dead. Targets only the states where the
+// backend is responsible for the next transition - S_CLAIMED (about to push
+// to S_PENDING), S_DONE / S_ERROR (about to read the result and reset to
+// S_EMPTY). S_PENDING / S_IN_FLIGHT are owned by the worker; we'll process
+// them ourselves regardless of whether the original backend is still around.
+//
+// Two-phase to keep the exclusive critical section narrow: scan under share
+// to gather candidates (PID liveness check is reentrant and cheap but
+// IsBackendPid does briefly take ProcArrayLock per call), then take exclusive
+// only if we found anything, re-checking each slot's state in case the
+// backend recovered between phases.
+fn reap_orphaned_slots() {
+    let candidates: Vec<usize> = {
+        let guard = RING.share();
+        (0..CAPACITY)
+            .filter(|&i| {
+                let s = &guard.slots[i];
+                if !matches!(s.state, S_CLAIMED | S_DONE | S_ERROR) {
+                    return false;
+                }
+                if s.owner_pid == 0 {
+                    return false;
+                }
+                !unsafe { pg_sys::IsBackendPid(s.owner_pid) }
+            })
+            .collect()
+    };
+    if candidates.is_empty() {
+        return;
+    }
+    let mut reaped = 0usize;
+    {
+        let mut guard = RING.exclusive();
+        for i in candidates {
+            let s = &mut guard.slots[i];
+            // Re-check state: a backend reading its own result and resetting
+            // to EMPTY (or recovering from a long stall) could have moved the
+            // slot since phase 1.
+            if !matches!(s.state, S_CLAIMED | S_DONE | S_ERROR) {
+                continue;
+            }
+            if s.owner_pid != 0 && unsafe { pg_sys::IsBackendPid(s.owner_pid) } {
+                continue;
+            }
+            *s = Slot::empty();
+            reaped += 1;
+        }
+    }
+    if reaped > 0 {
+        log!("tbw: reap_orphaned_slots: reset {reaped} orphaned slot(s)");
+    }
 }
 
 fn drain_pending() -> Vec<Pending> {

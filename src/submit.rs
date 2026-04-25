@@ -71,6 +71,7 @@ where
                 guard.cursor = ((i + 1) % CAPACITY) as u32;
                 guard.slots[i] = Slot::empty();
                 guard.slots[i].session_latch = my_latch as usize;
+                guard.slots[i].owner_pid = unsafe { pg_sys::MyProcPid };
                 (fill_meta_opt.take().expect("fill_meta consumed exactly once"))(
                     &mut guard.slots[i],
                 );

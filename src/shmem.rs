@@ -83,6 +83,11 @@ pub(crate) struct Slot {
     pub(crate) error_len: u16,
     pub(crate) error_msg: [u8; ERR_BUF_LEN],
     pub(crate) session_latch: usize,
+    // PID of the backend that claimed this slot. Used by the worker's reaper
+    // to detect orphaned slots: if the owner PID is no longer a live backend
+    // (per IsBackendPid), the slot is stuck because the backend died between
+    // claim and reading the result. Cleared on transition back to S_EMPTY.
+    pub(crate) owner_pid: i32,
     // TB pagination cursor for multi-row reads (QUERY_*, GET_ACCOUNT_*):
     // inclusive lower bound on TB timestamps. Zero means "no lower bound"
     // (first page). On subsequent pages the backend sets it to
@@ -110,6 +115,7 @@ impl Slot {
             error_len: 0,
             error_msg: [0; ERR_BUF_LEN],
             session_latch: 0,
+            owner_pid: 0,
             timestamp_min: 0,
         }
     }
