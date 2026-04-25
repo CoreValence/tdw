@@ -154,12 +154,9 @@ pub extern "C-unwind" fn tbw_worker_main(_arg: pg_sys::Datum) {
         .get()
         .and_then(|s| s.into_string().ok())
         .unwrap_or_default();
-    let cluster_id: u128 = cluster_id_raw.parse().unwrap_or_else(|e| {
-        error!(
-            "tbw: invalid tbw.tb_cluster_id={:?}: {}",
-            cluster_id_raw, e
-        )
-    });
+    let cluster_id: u128 = cluster_id_raw
+        .parse()
+        .unwrap_or_else(|e| error!("tbw: invalid tbw.tb_cluster_id={:?}: {}", cluster_id_raw, e));
 
     log!(
         "tbw: connecting to TigerBeetle at {} (resolved from {}) cluster {}",

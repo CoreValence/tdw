@@ -72,9 +72,9 @@ where
                 guard.slots[i] = Slot::empty();
                 guard.slots[i].session_latch = my_latch as usize;
                 guard.slots[i].owner_pid = unsafe { pg_sys::MyProcPid };
-                (fill_meta_opt.take().expect("fill_meta consumed exactly once"))(
-                    &mut guard.slots[i],
-                );
+                (fill_meta_opt
+                    .take()
+                    .expect("fill_meta consumed exactly once"))(&mut guard.slots[i]);
                 // CLAIMED parks the slot out of EMPTY (so no other backend
                 // grabs it) without yet exposing it to the worker. Promoted
                 // to PENDING below, after the pool has been written.

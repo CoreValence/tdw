@@ -51,5 +51,4 @@ pub(crate) fn register() {
         GucContext::Sighup,
         GucFlags::default(),
     );
-
 }

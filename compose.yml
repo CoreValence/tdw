@@ -4,26 +4,22 @@ services:
     entrypoint: [ "/bin/sh", "-c" ]
     command:
       - |
-        for i in 0 1 2; do
-          if [ ! -f /data/0_$$i.tigerbeetle ]; then
-            /tigerbeetle format --cluster=1 --replica=$$i --replica-count=3 /data/0_$$i.tigerbeetle
-          else
-            echo "already formatted: 0_$$i"
-          fi
-        done
+        if [ ! -f /data/0_0.tigerbeetle ]; then
+          /tigerbeetle format --cluster=1 --replica=0 --replica-count=1 /data/0_0.tigerbeetle
+        else
+          echo "already formatted: 0_0"
+        fi
     restart: "no"
     security_opt:
       - seccomp=unconfined
     volumes:
       - tigerbeetle-data:/data
 
-  # Three replicas on a fixed-IP bridge network. TB's --addresses= does not
-  # resolve DNS, so each replica boots with the same IP list in cluster-index
-  # order. All three share one volume with per-replica filenames (0_<i>.tigerbeetle).
+  # Single replica on a fixed-IP bridge network. TB's --addresses= does not
+  # resolve DNS, so the IP is hardcoded.
   tigerbeetle-0:
     image: ghcr.io/tigerbeetle/tigerbeetle:0.16.78
-    command: start --addresses=172.30.0.10:3000,172.30.0.11:3000,172.30.0.12:3000
-      /data/0_0.tigerbeetle
+    command: start --addresses=172.30.0.10:3000 /data/0_0.tigerbeetle
     restart: unless-stopped
     cap_add: [ IPC_LOCK ]
     security_opt: [ seccomp=unconfined ]
@@ -36,48 +32,12 @@ services:
       tigerbeetle-init:
         condition: service_completed_successfully
 
-  tigerbeetle-1:
-    image: ghcr.io/tigerbeetle/tigerbeetle:0.16.78
-    command: start --addresses=172.30.0.10:3000,172.30.0.11:3000,172.30.0.12:3000
-      /data/0_1.tigerbeetle
-    restart: unless-stopped
-    cap_add: [ IPC_LOCK ]
-    security_opt: [ seccomp=unconfined ]
-    networks:
-      tbw-net:
-        ipv4_address: 172.30.0.11
-    volumes:
-      - tigerbeetle-data:/data
-    depends_on:
-      tigerbeetle-init:
-        condition: service_completed_successfully
-
-  tigerbeetle-2:
-    image: ghcr.io/tigerbeetle/tigerbeetle:0.16.78
-    command: start --addresses=172.30.0.10:3000,172.30.0.11:3000,172.30.0.12:3000
-      /data/0_2.tigerbeetle
-    restart: unless-stopped
-    cap_add: [ IPC_LOCK ]
-    security_opt: [ seccomp=unconfined ]
-    networks:
-      tbw-net:
-        ipv4_address: 172.30.0.12
-    volumes:
-      - tigerbeetle-data:/data
-    depends_on:
-      tigerbeetle-init:
-        condition: service_completed_successfully
-
   postgres:
     build:
       context: .
       dockerfile: Dockerfile
     depends_on:
       tigerbeetle-0:
-        condition: service_started
-      tigerbeetle-1:
-        condition: service_started
-      tigerbeetle-2:
         condition: service_started
     # TB's Zig client uses io_uring for TCP; Docker's default seccomp blocks it.
     security_opt:
@@ -94,7 +54,7 @@ services:
       - -c
       - max_connections=1024
       - -c
-      - tbw.tb_addr=172.30.0.10:3000,172.30.0.11:3000,172.30.0.12:3000
+      - tbw.tb_addr=172.30.0.10:3000
       - -c
       - tbw.tb_cluster_id=1
     ports:
@@ -108,7 +68,7 @@ services:
   # One-shot: smoke + pgbench. Run via
   #   docker compose run --rm bench
   # Override params via env:
-  #   CLIENTS=64 DURATION=30 JOBS=8 docker compose run --rm bench
+  #   CLIENTS=64 DURATION=30 JOBS=8 PROGRESS=5 docker compose run --rm bench
   bench:
     image: postgres:18-bookworm
     profiles: [ "bench" ]
@@ -122,9 +82,10 @@ services:
       PGPORT: "5432"
       PGDATABASE: tbw
       PGUSER: postgres
-      CLIENTS: "${CLIENTS:-1000}"
-      DURATION: "${DURATION:-60}"
-      JOBS: "${JOBS:-1000}"
+      CLIENTS: "${CLIENTS:-200}"
+      DURATION: "${DURATION:-120}"
+      JOBS: "${JOBS:-64}"
+      PROGRESS: "${PROGRESS:-10}"
     volumes:
       - ./sql:/sql:ro
     entrypoint: [ "/bin/bash", "-eu", "-o", "pipefail", "-c" ]
@@ -136,8 +97,9 @@ services:
         echo "== seeding bench accounts =="
         psql -v ON_ERROR_STOP=1 -f /sql/bench_setup.sql
         echo
-        echo "== pgbench  c=$$CLIENTS  j=$$JOBS  T=$${DURATION}s =="
+        echo "== pgbench  c=$$CLIENTS  j=$$JOBS  T=$${DURATION}s  progress=$${PROGRESS}s =="
         pgbench -n -c "$$CLIENTS" -j "$$JOBS" -T "$$DURATION" \
+                --progress "$$PROGRESS" \
                 -f /sql/bench_transfer.sql
 
 networks:

@@ -2,7 +2,9 @@
 
 use pgrx::prelude::*;
 
-use crate::shmem::{BATCH_LEG_LEN, MAX_QUERY_ROWS, OP_CREATE_TRANSFER, OP_CREATE_TRANSFER_BATCH, OP_LOOKUP_ACCOUNT};
+use crate::shmem::{
+    BATCH_LEG_LEN, MAX_QUERY_ROWS, OP_CREATE_TRANSFER, OP_CREATE_TRANSFER_BATCH, OP_LOOKUP_ACCOUNT,
+};
 use crate::submit::submit_and_wait;
 
 // TB transfer flags we care about. Mirrors tb_client.h enum.
@@ -102,7 +104,16 @@ fn submit_create_transfer(
 fn parse_leg(
     leg: &serde_json::Value,
     i: usize,
-) -> (uuid::Uuid, uuid::Uuid, uuid::Uuid, uuid::Uuid, u128, u32, u16, u16) {
+) -> (
+    uuid::Uuid,
+    uuid::Uuid,
+    uuid::Uuid,
+    uuid::Uuid,
+    u128,
+    u32,
+    u16,
+    u16,
+) {
     let id = parse_uuid_field(leg, "id", i);
     let debit = parse_uuid_field(leg, "debit", i);
     let credit = parse_uuid_field(leg, "credit", i);
@@ -278,19 +289,23 @@ fn pack_and_submit_legs_with_fixed_credit(
 mod accounts {
     use pgrx::prelude::*;
 
-    use crate::pack::{AccountRow, BalanceRow, TransferRow, unpack_account_row, unpack_balance_row, unpack_transfer_row};
-    use crate::shmem::{OP_CREATE_ACCOUNT, OP_GET_ACCOUNT_BALANCES, OP_GET_ACCOUNT_TRANSFERS, OP_LOOKUP_ACCOUNT, OP_QUERY_ACCOUNTS};
+    use crate::pack::{
+        AccountRow, BalanceRow, TransferRow, unpack_account_row, unpack_balance_row,
+        unpack_transfer_row,
+    };
+    use crate::shmem::{
+        OP_CREATE_ACCOUNT, OP_GET_ACCOUNT_BALANCES, OP_GET_ACCOUNT_TRANSFERS, OP_LOOKUP_ACCOUNT,
+        OP_QUERY_ACCOUNTS,
+    };
     use crate::submit::submit_and_wait;
 
-    use super::{ACCOUNT_FILTER_FLAG_BITS, ACCOUNT_FLAG_BITS, QUERY_FILTER_FLAG_BITS, check_filter_args, check_ledger_code, flags_from_i32};
+    use super::{
+        ACCOUNT_FILTER_FLAG_BITS, ACCOUNT_FLAG_BITS, QUERY_FILTER_FLAG_BITS, check_filter_args,
+        check_ledger_code, flags_from_i32,
+    };
 
     #[pg_extern]
-    fn open(
-        id: pgrx::Uuid,
-        ledger: i32,
-        code: i32,
-        flags: pgrx::default!(i32, 0),
-    ) -> pgrx::Uuid {
+    fn open(id: pgrx::Uuid, ledger: i32, code: i32, flags: pgrx::default!(i32, 0)) -> pgrx::Uuid {
         check_ledger_code(ledger, code);
         let flag_bits = flags_from_i32(flags, ACCOUNT_FLAG_BITS);
 
@@ -773,7 +788,9 @@ mod transfers {
             if has_amount {
                 let a = match d.get("amount").and_then(|v| v.as_i64()) {
                     Some(a) if a >= 0 => a as u128,
-                    _ => error!("transfers.allocate: destinations[{i}].amount must be a non-negative integer"),
+                    _ => error!(
+                        "transfers.allocate: destinations[{i}].amount must be a non-negative integer"
+                    ),
                 };
                 planned.push((to, a));
                 claimed = claimed.saturating_add(a);
@@ -858,9 +875,13 @@ mod transfers {
                 Some(v) if v.is_null() => drain_balance(from),
                 Some(v) => match v.as_i64() {
                     Some(m) if m >= 0 => m as u128,
-                    _ => error!("transfers.waterfall: sources[{i}].max must be non-negative integer or null"),
+                    _ => error!(
+                        "transfers.waterfall: sources[{i}].max must be non-negative integer or null"
+                    ),
                 },
-                None => error!("transfers.waterfall: sources[{i}].max is required (use null to drain)"),
+                None => {
+                    error!("transfers.waterfall: sources[{i}].max is required (use null to drain)")
+                }
             };
             let take = cap.min(remaining);
             if take > 0 {

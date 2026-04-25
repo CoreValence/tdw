@@ -3,9 +3,6 @@ name         = "tbw"
 version      = "0.1.0"
 edition      = "2024"
 rust-version = "1.95.0"
-description  = "tbw — a programmable ledger layer on TigerBeetle"
-repository   = "https://github.com/CoreValence/tbw"
-authors      = ["developers@corevalence.com"]
 publish      = false
 
 [lib]

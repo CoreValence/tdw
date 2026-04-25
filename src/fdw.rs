@@ -37,8 +37,8 @@ use pgrx::{AllocatedByRust, PgBox};
 use crate::pack::{unpack_account_row, unpack_balance_row, unpack_transfer_row};
 use crate::shmem::{
     BATCH_LEG_LEN, MAX_BATCH_LEGS, MAX_QUERY_ROWS, OP_CREATE_ACCOUNT, OP_CREATE_TRANSFER,
-    OP_CREATE_TRANSFER_BATCH, OP_GET_ACCOUNT_BALANCES, OP_GET_ACCOUNT_TRANSFERS,
-    OP_LOOKUP_ACCOUNT, OP_LOOKUP_TRANSFER, OP_QUERY_ACCOUNTS, OP_QUERY_TRANSFERS, RECORD_LEN, Slot,
+    OP_CREATE_TRANSFER_BATCH, OP_GET_ACCOUNT_BALANCES, OP_GET_ACCOUNT_TRANSFERS, OP_LOOKUP_ACCOUNT,
+    OP_LOOKUP_TRANSFER, OP_QUERY_ACCOUNTS, OP_QUERY_TRANSFERS, RECORD_LEN, Slot,
 };
 use crate::submit::{ReadBack, submit_and_wait, submit_and_wait_with_legs};
 
@@ -68,8 +68,8 @@ unsafe fn tuple_desc_attr(
             // TupleDescData ends with a FAM `attrs[]` of FormData_pg_attribute.
             // bindgen renders it as either a sized array or an
             // __IncompleteArrayField; addr_of_mut works in both cases.
-            let base = std::ptr::addr_of_mut!((*tupdesc).attrs)
-                as *mut pg_sys::FormData_pg_attribute;
+            let base =
+                std::ptr::addr_of_mut!((*tupdesc).attrs) as *mut pg_sys::FormData_pg_attribute;
             base.offset(i as isize)
         }
     }
@@ -771,7 +771,10 @@ fn pushable_columns(kind: TableKind) -> &'static [(i16, QualField)] {
         TableKind::Transfers => &[
             (attr::transfers::ID, QualField::Id),
             (attr::transfers::DEBIT_ACCOUNT_ID, QualField::DebitAccountId),
-            (attr::transfers::CREDIT_ACCOUNT_ID, QualField::CreditAccountId),
+            (
+                attr::transfers::CREDIT_ACCOUNT_ID,
+                QualField::CreditAccountId,
+            ),
             (attr::transfers::LEDGER, QualField::Ledger),
             (attr::transfers::CODE, QualField::Code),
             (attr::transfers::FLAGS, QualField::Flags),
@@ -833,7 +836,12 @@ unsafe fn split_clauses(
     clauses: *mut pg_sys::List,
     kind: TableKind,
     baserel: *mut pg_sys::RelOptInfo,
-) -> (PushedQuals, Vec<(QualField, i32)>, *mut pg_sys::List, *mut pg_sys::List) {
+) -> (
+    PushedQuals,
+    Vec<(QualField, i32)>,
+    *mut pg_sys::List,
+    *mut pg_sys::List,
+) {
     let mut pushed = PushedQuals::default();
     let mut param_map: Vec<(QualField, i32)> = Vec::new();
     let mut fdw_exprs: *mut pg_sys::List = std::ptr::null_mut();
@@ -847,7 +855,14 @@ unsafe fn split_clauses(
         let cells = (*clauses).elements;
         for i in 0..nelems {
             let node = (*cells.add(i)).ptr_value as *mut pg_sys::Node;
-            if try_push_clause(node, kind, baserel, &mut pushed, &mut param_map, &mut fdw_exprs) {
+            if try_push_clause(
+                node,
+                kind,
+                baserel,
+                &mut pushed,
+                &mut param_map,
+                &mut fdw_exprs,
+            ) {
                 continue;
             }
             leftover = pg_sys::lappend(leftover, node as *mut c_void);
@@ -1174,11 +1189,7 @@ unsafe fn encode_private(
                     let raw = pg_sys::palloc(varsize) as *mut u8;
                     // Set vl_len_ via SET_VARSIZE equivalent — 4-byte header.
                     let len_word = ((varsize as u32) << 2) as i32;
-                    std::ptr::copy_nonoverlapping(
-                        (&len_word as *const i32) as *const u8,
-                        raw,
-                        4,
-                    );
+                    std::ptr::copy_nonoverlapping((&len_word as *const i32) as *const u8, raw, 4);
                     std::ptr::copy_nonoverlapping(bytes.as_ptr(), raw.add(4), 16);
                     (pg_sys::Datum::from(raw), false)
                 }
@@ -1575,7 +1586,10 @@ fn drive_pagination(kind: TableKind, fill: &PageFill, requested: u32) -> ReadBac
             _ => break,
         }
     }
-    ReadBack { count: total, bytes }
+    ReadBack {
+        count: total,
+        bytes,
+    }
 }
 
 // Timestamp offset in each kind's packed record. Mirrors pack.rs byte layouts.
@@ -1709,12 +1723,7 @@ unsafe fn set_datum_i64(values: *mut pg_sys::Datum, nulls: *mut bool, idx: usize
     }
 }
 
-unsafe fn set_datum_uuid(
-    values: *mut pg_sys::Datum,
-    nulls: *mut bool,
-    idx: usize,
-    v: pgrx::Uuid,
-) {
+unsafe fn set_datum_uuid(values: *mut pg_sys::Datum, nulls: *mut bool, idx: usize, v: pgrx::Uuid) {
     unsafe {
         let raw = pg_sys::palloc(16) as *mut u8;
         std::ptr::copy_nonoverlapping(v.as_bytes().as_ptr(), raw, 16);
@@ -1809,7 +1818,8 @@ unsafe extern "C-unwind" fn explain_foreign_scan(
             TableKind::Accounts => "QUERY_ACCOUNTS",
             TableKind::Transfers if will_have(QualField::Id) => "LOOKUP_TRANSFER",
             TableKind::Transfers
-                if will_have(QualField::DebitAccountId) || will_have(QualField::CreditAccountId) =>
+                if will_have(QualField::DebitAccountId)
+                    || will_have(QualField::CreditAccountId) =>
             {
                 "GET_ACCOUNT_TRANSFERS"
             }
@@ -1849,7 +1859,10 @@ unsafe extern "C-unwind" fn plan_foreign_modify(
 ) -> *mut pg_sys::List {
     unsafe {
         if (*plan).operation != pg_sys::CmdType::CMD_INSERT {
-            pg_sys::error!("tbw_fdw: only INSERT is supported; got {:?}", (*plan).operation);
+            pg_sys::error!(
+                "tbw_fdw: only INSERT is supported; got {:?}",
+                (*plan).operation
+            );
         }
         // rtable is on the parent Query; fetch via the PlannerInfo parent chain.
         // Simpler: just return empty private; we'll read relation OID from
@@ -2134,9 +2147,8 @@ unsafe fn read_transfer_fields(
                 pg_sys::error!("tbw_fdw: amount is NULL");
             }
             use pgrx::FromDatum;
-            let n: pgrx::AnyNumeric =
-                pgrx::AnyNumeric::from_datum(*values.add(a), false)
-                    .unwrap_or_else(|| pg_sys::error!("tbw_fdw: invalid numeric"));
+            let n: pgrx::AnyNumeric = pgrx::AnyNumeric::from_datum(*values.add(a), false)
+                .unwrap_or_else(|| pg_sys::error!("tbw_fdw: invalid numeric"));
             let s = n.to_string();
             s.parse::<u128>()
                 .unwrap_or_else(|e| pg_sys::error!("tbw_fdw: amount {s}: {e}"))
@@ -2195,10 +2207,8 @@ unsafe fn read_account_fields(
         let values = (*slot).tts_values;
         let nulls = (*slot).tts_isnull;
 
-        let id_attnum = m
-            .id
-            .unwrap_or_else(|| pg_sys::error!("tbw_fdw: id column missing")) as usize
-            - 1;
+        let id_attnum =
+            m.id.unwrap_or_else(|| pg_sys::error!("tbw_fdw: id column missing")) as usize - 1;
         if *nulls.add(id_attnum) {
             pg_sys::error!("tbw_fdw: id is NULL");
         }
@@ -2211,7 +2221,11 @@ unsafe fn read_account_fields(
                 Some(a) => a as usize - 1,
                 None => pg_sys::error!("tbw_fdw: required int column missing"),
             };
-            if *nulls.add(a) { 0 } else { (*values.add(a)).value() as i32 }
+            if *nulls.add(a) {
+                0
+            } else {
+                (*values.add(a)).value() as i32
+            }
         };
 
         let ledger = read_i32(m.ledger) as u32;
@@ -2222,6 +2236,11 @@ unsafe fn read_account_fields(
         let code = code_i as u16;
         let flags = read_i32(m.flags) as u32;
 
-        AccountFields { id, ledger, code, flags }
+        AccountFields {
+            id,
+            ledger,
+            code,
+            flags,
+        }
     }
 }

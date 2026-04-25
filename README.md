@@ -23,7 +23,7 @@ and `tbw` routes both to TB.
 
 ## Quick start
 
-The bundled `compose.yml` runs three TB replicas, a Postgres 18 image with `tbw` preloaded, and a smoke/bench runner.
+The bundled `compose.yml` runs a single-replica TB cluster, a Postgres 18 image with `tbw` preloaded, and a smoke/bench runner.
 
 ```sh
 docker compose up -d postgres
@@ -58,7 +58,7 @@ In `postgresql.conf`:
 
 ```
 shared_preload_libraries = 'tbw'
-tbw.tb_addr              = '172.30.0.10:3000,172.30.0.11:3000,172.30.0.12:3000'
+tbw.tb_addr              = '172.30.0.10:3000'   # comma-separate for multi-replica
 tbw.tb_cluster_id        = '1'
 ```
 
@@ -92,13 +92,13 @@ docker run --rm \
   tbw:pg18 \
   postgres \
     -c shared_preload_libraries=tbw \
-    -c tbw.tb_addr=10.0.0.10:3000,10.0.0.11:3000,10.0.0.12:3000 \
+    -c tbw.tb_addr=10.0.0.10:3000 \
     -c tbw.tb_cluster_id=1
 ```
 
 `seccomp=unconfined` is required because TigerBeetle's Zig client uses `io_uring` for TCP, and Docker's default seccomp profile blocks it.
 
-For the full multi-service setup (three TB replicas + Postgres built from source), use the bundled `compose.yml` and `Dockerfile`.
+For the full multi-service setup (TB + Postgres built from source), use the bundled `compose.yml` and `Dockerfile`.
 
 ## Configuration
 
