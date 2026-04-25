@@ -23,9 +23,9 @@ pub extern "C-unwind" fn _PG_init() {
     pg_shmem_init!(RESULTS = ResultPool::empty());
     pg_shmem_init!(WORKER_LATCH = 0usize);
 
-    BackgroundWorkerBuilder::new("beetle worker")
-        .set_function("beetle_worker_main")
-        .set_library("beetle")
+    BackgroundWorkerBuilder::new("tbw worker")
+        .set_function("tbw_worker_main")
+        .set_library("tbw")
         .set_start_time(BgWorkerStartTime::PostmasterStart)
         .set_restart_time(Some(Duration::from_secs(5)))
         .enable_shmem_access(None)

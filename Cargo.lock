@@ -34,18 +34,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
-name = "beetle"
-version = "0.1.0"
-dependencies = [
- "libc",
- "pgrx",
- "serde_json",
- "tigerbeetle-unofficial",
- "tokio",
- "uuid",
-]
-
-[[package]]
 name = "bindgen"
 version = "0.72.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -929,6 +917,18 @@ name = "tap"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "55937e1799185b12863d447f42597ed69d9928686b8d88a1df17376a097d8369"
+
+[[package]]
+name = "tbw"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "pgrx",
+ "serde_json",
+ "tigerbeetle-unofficial",
+ "tokio",
+ "uuid",
+]
 
 [[package]]
 name = "thiserror"

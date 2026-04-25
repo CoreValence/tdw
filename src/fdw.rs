@@ -119,7 +119,7 @@ unsafe fn validate_schema(rel: pg_sys::Relation, kind: TableKind) {
         let expected = expected_columns(kind);
         if natts != expected.len() {
             pg_sys::error!(
-                "beetle_fdw: {:?} has {} columns, expected {}",
+                "tbw_fdw: {:?} has {} columns, expected {}",
                 kind,
                 natts,
                 expected.len()
@@ -129,7 +129,7 @@ unsafe fn validate_schema(rel: pg_sys::Relation, kind: TableKind) {
             let attr = pg_sys::TupleDescAttr(tupdesc, i as i32);
             if (*attr).attisdropped {
                 pg_sys::error!(
-                    "beetle_fdw: column {} of {:?} is dropped; expected {}",
+                    "tbw_fdw: column {} of {:?} is dropped; expected {}",
                     i + 1,
                     kind,
                     want_name
@@ -138,7 +138,7 @@ unsafe fn validate_schema(rel: pg_sys::Relation, kind: TableKind) {
             let got_name = CStr::from_ptr((*attr).attname.data.as_ptr()).to_string_lossy();
             if got_name != *want_name {
                 pg_sys::error!(
-                    "beetle_fdw: column {} of {:?} is named {:?}, expected {:?}",
+                    "tbw_fdw: column {} of {:?} is named {:?}, expected {:?}",
                     i + 1,
                     kind,
                     got_name,
@@ -147,7 +147,7 @@ unsafe fn validate_schema(rel: pg_sys::Relation, kind: TableKind) {
             }
             if (*attr).atttypid != *want_oid {
                 pg_sys::error!(
-                    "beetle_fdw: column {:?} of {:?} has type oid {}, expected {}",
+                    "tbw_fdw: column {:?} of {:?} has type oid {}, expected {}",
                     want_name,
                     kind,
                     (*attr).atttypid.to_u32(),
@@ -325,12 +325,12 @@ struct AccountInsertAttnums {
 // Exposed to SQL via extension_sql! below. The function name must match the
 // HANDLER clause of CREATE FOREIGN DATA WRAPPER.
 #[pg_extern(sql = "
-    CREATE OR REPLACE FUNCTION beetle_fdw_handler()
+    CREATE OR REPLACE FUNCTION tbw_fdw_handler()
     RETURNS fdw_handler
     LANGUAGE c
     AS 'MODULE_PATHNAME', '@FUNCTION_NAME@';
 ")]
-fn beetle_fdw_handler() -> PgBox<pg_sys::FdwRoutine, AllocatedByRust> {
+fn tbw_fdw_handler() -> PgBox<pg_sys::FdwRoutine, AllocatedByRust> {
     let mut r = unsafe {
         PgBox::<pg_sys::FdwRoutine, AllocatedByRust>::alloc_node(pg_sys::NodeTag::T_FdwRoutine)
     };
@@ -361,10 +361,10 @@ fn beetle_fdw_handler() -> PgBox<pg_sys::FdwRoutine, AllocatedByRust> {
 // extension's sql/ directory.
 extension_sql!(
     r#"
-CREATE FOREIGN DATA WRAPPER beetle HANDLER beetle_fdw_handler NO VALIDATOR;
+CREATE FOREIGN DATA WRAPPER tbw HANDLER tbw_fdw_handler NO VALIDATOR;
 "#,
-    name = "beetle_fdw_wrapper",
-    requires = [beetle_fdw_handler],
+    name = "tbw_fdw_wrapper",
+    requires = [tbw_fdw_handler],
 );
 
 // -----------------------------------------------------------------------------
@@ -682,7 +682,7 @@ unsafe extern "C-unwind" fn get_foreign_plan(
 ) -> *mut pg_sys::ForeignScan {
     unsafe {
         let kind = table_kind_from_oid(ftable_oid).unwrap_or_else(|| {
-            pg_sys::error!("beetle_fdw: unknown foreign table oid {:?}", ftable_oid);
+            pg_sys::error!("tbw_fdw: unknown foreign table oid {:?}", ftable_oid);
         });
 
         // Extract pushable equalities from scan_clauses. Const RHS values land
@@ -1135,7 +1135,7 @@ unsafe fn decode_private(
             0 => TableKind::Accounts,
             1 => TableKind::Transfers,
             2 => TableKind::Balances,
-            _ => pg_sys::error!("beetle_fdw: invalid table kind in fdw_private"),
+            _ => pg_sys::error!("tbw_fdw: invalid table kind in fdw_private"),
         };
         let q = PushedQuals {
             id: read_bytea16(1),
@@ -1202,10 +1202,10 @@ unsafe extern "C-unwind" fn get_foreign_upper_paths(
         if lim_i64 <= 0 {
             return;
         }
-        // No longer clamped to MAX_QUERY_ROWS: dispatch_scan paginates across
-        // multiple TB round-trips, so user LIMIT is honored up to the
-        // beetle.fdw_pagination_cap GUC.
-        let lim = (lim_i64 as u32).min(pagination_cap());
+        // No clamp: dispatch_scan paginates across multiple TB round-trips,
+        // so user LIMIT is honored exactly. Match Postgres-native behavior —
+        // if you want a ceiling, use statement_timeout.
+        let lim = lim_i64 as u32;
 
         // Mirror the existing scan path but lower its rows estimate and tag the
         // limit onto fdw_private. The simplest way to thread it through is to
@@ -1324,18 +1324,6 @@ unsafe fn apply_param_states(
     }
 }
 
-// Row ceilings for paginated scans — both GUC-configurable (Sighup context)
-// via beetle.fdw_default_scan_limit and beetle.fdw_pagination_cap. These
-// guard against draining an unbounded result set into backend memory (e.g.,
-// a typo-elided WHERE on a multi-million-row ledger). Pagination still
-// honors a smaller user LIMIT exactly.
-fn pagination_cap() -> u32 {
-    crate::guc::FDW_PAGINATION_CAP.get().max(1) as u32
-}
-fn default_scan_limit() -> u32 {
-    crate::guc::FDW_DEFAULT_SCAN_LIMIT.get().max(1) as u32
-}
-
 // Slot fill template for multi-row ops — captures the parameters that stay
 // constant across pages (op, id/ledger/code, filter flags). `page_limit` and
 // `timestamp_min` vary per iteration and are applied by drive_pagination.
@@ -1363,14 +1351,14 @@ unsafe fn dispatch_scan(kind: TableKind, q: &PushedQuals) -> ReadBack {
                 count: 0,
                 bytes: vec![],
             },
-            Err(msg) => error!("beetle_fdw: {}", msg),
+            Err(msg) => error!("tbw_fdw: {}", msg),
         };
     }
 
-    // Multi-row path. Build the per-kind fill template and requested ceiling,
-    // then let drive_pagination loop until TB exhausts the filter or we've
-    // satisfied the requested limit.
-    let requested = q.limit.unwrap_or(default_scan_limit()).min(pagination_cap());
+    // Multi-row path. With no user LIMIT we drain until TB exhausts the
+    // filter (PG-native behavior — `SELECT * FROM t` returns every row).
+    // Use statement_timeout if you want a bound on long scans.
+    let requested = q.limit.unwrap_or(u32::MAX);
     let fill = match kind {
         TableKind::Accounts => PageFill {
             op: OP_QUERY_ACCOUNTS,
@@ -1411,7 +1399,7 @@ unsafe fn dispatch_scan(kind: TableKind, q: &PushedQuals) -> ReadBack {
         }
         TableKind::Balances => {
             let id = q.id.unwrap_or_else(|| {
-                error!("beetle_fdw: tb_account_balances requires WHERE account_id = <uuid>");
+                error!("tbw_fdw: tb_account_balances requires WHERE account_id = <uuid>");
             });
             let flag_bits = q.flags.unwrap_or(FF_BOTH) | FF_BOTH;
             PageFill {
@@ -1431,7 +1419,8 @@ unsafe fn dispatch_scan(kind: TableKind, q: &PushedQuals) -> ReadBack {
 // requested row count is satisfied or TB returns fewer rows than asked for
 // (its signal that the filter is exhausted). Rows accumulate on the backend's
 // transient heap — the shmem result buffer only has to hold one page at a
-// time. User LIMIT is honored exactly up to beetle.fdw_pagination_cap.
+// time. User LIMIT is honored exactly; with no LIMIT, scans run until TB
+// exhausts the filter (Postgres-native behavior).
 fn drive_pagination(kind: TableKind, fill: &PageFill, requested: u32) -> ReadBack {
     let mut total: u32 = 0;
     let mut bytes: Vec<u8> = Vec::new();
@@ -1454,7 +1443,7 @@ fn drive_pagination(kind: TableKind, fill: &PageFill, requested: u32) -> ReadBac
         let rb = match res {
             Ok(rb) => rb,
             Err(msg) if msg == "not found" => break,
-            Err(msg) => error!("beetle_fdw: {}", msg),
+            Err(msg) => error!("tbw_fdw: {}", msg),
         };
         if rb.count == 0 {
             break;
@@ -1717,11 +1706,11 @@ unsafe extern "C-unwind" fn explain_foreign_scan(
             TableKind::Transfers => "QUERY_TRANSFERS",
             TableKind::Balances => "GET_ACCOUNT_BALANCES",
         };
-        let label = c"Beetle Op";
+        let label = c"Tbw Op";
         let val = std::ffi::CString::new(op_label).unwrap();
         pg_sys::ExplainPropertyText(label.as_ptr(), val.as_ptr(), es);
         if let Some(lim) = quals.limit {
-            let k = c"Beetle Limit";
+            let k = c"Tbw Limit";
             pg_sys::ExplainPropertyInteger(k.as_ptr(), std::ptr::null(), lim as i64, es);
         }
     }
@@ -1750,7 +1739,7 @@ unsafe extern "C-unwind" fn plan_foreign_modify(
 ) -> *mut pg_sys::List {
     unsafe {
         if (*plan).operation != pg_sys::CmdType::CMD_INSERT {
-            pg_sys::error!("beetle_fdw: only INSERT is supported; got {:?}", (*plan).operation);
+            pg_sys::error!("tbw_fdw: only INSERT is supported; got {:?}", (*plan).operation);
         }
         // rtable is on the parent Query; fetch via the PlannerInfo parent chain.
         // Simpler: just return empty private; we'll read relation OID from
@@ -1772,7 +1761,7 @@ unsafe extern "C-unwind" fn begin_foreign_modify(
         let rel = (*rinfo).ri_RelationDesc;
         let oid = (*(*rel).rd_rel).oid;
         let kind = table_kind_from_oid(oid).unwrap_or_else(|| {
-            pg_sys::error!("beetle_fdw: unknown foreign table for INSERT");
+            pg_sys::error!("tbw_fdw: unknown foreign table for INSERT");
         });
         validate_schema(rel, kind);
         let tupdesc = (*rel).rd_att;
@@ -1815,7 +1804,7 @@ unsafe extern "C-unwind" fn begin_foreign_modify(
                 ModifyState::Accounts(m)
             }
             TableKind::Balances => {
-                pg_sys::error!("beetle_fdw: tb_account_balances is read-only")
+                pg_sys::error!("tbw_fdw: tb_account_balances is read-only")
             }
         };
         (*rinfo).ri_FdwState = Box::into_raw(Box::new(state)) as *mut c_void;
@@ -1832,7 +1821,7 @@ unsafe extern "C-unwind" fn exec_foreign_insert(
     unsafe {
         let state_ptr = (*rinfo).ri_FdwState as *mut ModifyState;
         if state_ptr.is_null() {
-            pg_sys::error!("beetle_fdw: modify state not initialized");
+            pg_sys::error!("tbw_fdw: modify state not initialized");
         }
         let state = &*state_ptr;
         let res = match state {
@@ -1862,7 +1851,7 @@ unsafe extern "C-unwind" fn exec_foreign_insert(
             }
         };
         if let Err(msg) = res {
-            pg_sys::error!("beetle_fdw: {}", msg);
+            pg_sys::error!("tbw_fdw: {}", msg);
         }
         let _ = plan_slot;
         slot
@@ -1880,7 +1869,7 @@ unsafe extern "C-unwind" fn exec_foreign_batch_insert(
     unsafe {
         let state_ptr = (*rinfo).ri_FdwState as *mut ModifyState;
         if state_ptr.is_null() {
-            pg_sys::error!("beetle_fdw: modify state not initialized");
+            pg_sys::error!("tbw_fdw: modify state not initialized");
         }
         let state = &*state_ptr;
         let attnums = match state {
@@ -1888,7 +1877,7 @@ unsafe extern "C-unwind" fn exec_foreign_batch_insert(
             // GetForeignModifyBatchSize returns 1 for accounts, so Pg shouldn't
             // call the batch path for them — defensive error anyway.
             ModifyState::Accounts(_) => {
-                pg_sys::error!("beetle_fdw: batch insert not supported for tb_accounts");
+                pg_sys::error!("tbw_fdw: batch insert not supported for tb_accounts");
             }
         };
         let n = *num_slots as usize;
@@ -1897,7 +1886,7 @@ unsafe extern "C-unwind" fn exec_foreign_batch_insert(
         }
         if n > MAX_BATCH_LEGS {
             pg_sys::error!(
-                "beetle_fdw: batch of {} exceeds MAX_BATCH_LEGS={}",
+                "tbw_fdw: batch of {} exceeds MAX_BATCH_LEGS={}",
                 n,
                 MAX_BATCH_LEGS
             );
@@ -1930,7 +1919,7 @@ unsafe extern "C-unwind" fn exec_foreign_batch_insert(
             },
         ) {
             Ok(_) => {}
-            Err(msg) => pg_sys::error!("beetle_fdw: {}", msg),
+            Err(msg) => pg_sys::error!("tbw_fdw: {}", msg),
         }
         let _ = plan_slots;
         slots
@@ -2010,14 +1999,14 @@ unsafe fn read_transfer_fields(
                 Some(a) => a as usize - 1,
                 None => {
                     if required {
-                        pg_sys::error!("beetle_fdw: column missing in tuple descriptor");
+                        pg_sys::error!("tbw_fdw: column missing in tuple descriptor");
                     }
                     return [0u8; 16];
                 }
             };
             if *nulls.add(a) {
                 if required {
-                    pg_sys::error!("beetle_fdw: required UUID column is NULL");
+                    pg_sys::error!("tbw_fdw: required UUID column is NULL");
                 }
                 return [0u8; 16];
             }
@@ -2029,23 +2018,23 @@ unsafe fn read_transfer_fields(
         let read_numeric_u128 = |attnum: Option<c_int>| -> u128 {
             let a = match attnum {
                 Some(a) => a as usize - 1,
-                None => pg_sys::error!("beetle_fdw: amount column missing"),
+                None => pg_sys::error!("tbw_fdw: amount column missing"),
             };
             if *nulls.add(a) {
-                pg_sys::error!("beetle_fdw: amount is NULL");
+                pg_sys::error!("tbw_fdw: amount is NULL");
             }
             use pgrx::FromDatum;
             let n: pgrx::AnyNumeric =
                 pgrx::AnyNumeric::from_datum(*values.add(a), false)
-                    .unwrap_or_else(|| pg_sys::error!("beetle_fdw: invalid numeric"));
+                    .unwrap_or_else(|| pg_sys::error!("tbw_fdw: invalid numeric"));
             let s = n.to_string();
             s.parse::<u128>()
-                .unwrap_or_else(|e| pg_sys::error!("beetle_fdw: amount {s}: {e}"))
+                .unwrap_or_else(|e| pg_sys::error!("tbw_fdw: amount {s}: {e}"))
         };
         let read_i32 = |attnum: Option<c_int>| -> i32 {
             let a = match attnum {
                 Some(a) => a as usize - 1,
-                None => pg_sys::error!("beetle_fdw: required int column missing"),
+                None => pg_sys::error!("tbw_fdw: required int column missing"),
             };
             if *nulls.add(a) {
                 0
@@ -2062,7 +2051,7 @@ unsafe fn read_transfer_fields(
         let ledger = read_i32(m.ledger) as u32;
         let code_i = read_i32(m.code);
         if !(0..=u16::MAX as i32).contains(&code_i) {
-            pg_sys::error!("beetle_fdw: code must fit in u16");
+            pg_sys::error!("tbw_fdw: code must fit in u16");
         }
         let code = code_i as u16;
         let flags = read_i32(m.flags) as u32;
@@ -2098,10 +2087,10 @@ unsafe fn read_account_fields(
 
         let id_attnum = m
             .id
-            .unwrap_or_else(|| pg_sys::error!("beetle_fdw: id column missing")) as usize
+            .unwrap_or_else(|| pg_sys::error!("tbw_fdw: id column missing")) as usize
             - 1;
         if *nulls.add(id_attnum) {
-            pg_sys::error!("beetle_fdw: id is NULL");
+            pg_sys::error!("tbw_fdw: id is NULL");
         }
         let ptr = (*values.add(id_attnum)).cast_mut_ptr::<u8>();
         let mut id = [0u8; 16];
@@ -2110,7 +2099,7 @@ unsafe fn read_account_fields(
         let read_i32 = |attnum: Option<c_int>| -> i32 {
             let a = match attnum {
                 Some(a) => a as usize - 1,
-                None => pg_sys::error!("beetle_fdw: required int column missing"),
+                None => pg_sys::error!("tbw_fdw: required int column missing"),
             };
             if *nulls.add(a) { 0 } else { (*values.add(a)).value() as i32 }
         };
@@ -2118,7 +2107,7 @@ unsafe fn read_account_fields(
         let ledger = read_i32(m.ledger) as u32;
         let code_i = read_i32(m.code);
         if !(0..=u16::MAX as i32).contains(&code_i) {
-            pg_sys::error!("beetle_fdw: code must fit in u16");
+            pg_sys::error!("tbw_fdw: code must fit in u16");
         }
         let code = code_i as u16;
         let flags = read_i32(m.flags) as u32;

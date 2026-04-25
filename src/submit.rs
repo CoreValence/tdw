@@ -44,7 +44,7 @@ where
 {
     let worker_latch = *WORKER_LATCH.share();
     if worker_latch == 0 {
-        return Err("beetle background worker not running".into());
+        return Err("tbw background worker not running".into());
     }
 
     let my_latch = unsafe { pg_sys::MyLatch };

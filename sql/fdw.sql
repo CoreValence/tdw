@@ -1,24 +1,22 @@
 -- Foreign data wrapper bindings for TigerBeetle.
 --
--- Run after `CREATE EXTENSION beetle`. The wrapper itself (`beetle`) is
+-- Run after `CREATE EXTENSION tbw`. The wrapper itself (`tbw`) is
 -- registered by the extension; this file creates a server and the three
 -- foreign tables mapped onto TB accounts, transfers, and balances.
 --
--- All routing goes through the same shmem ring the beetle.* functions use —
+-- All routing goes through the same shmem ring the tbw.* functions use —
 -- there's only one TB connection per cluster and the server is purely a Pg
 -- catalog requirement (no connection options need setting).
 --
 -- Multi-row reads (QUERY_*, GET_ACCOUNT_*) paginate across TB round-trips
--- under the hood, so large result sets work transparently. Per-query ceilings:
---   - Unlimited scans drain up to beetle.fdw_default_scan_limit rows (1000).
---   - Explicit LIMIT N is honored up to beetle.fdw_pagination_cap (10000);
---     beyond that, drive the scan in application code with narrower queries.
--- Both GUCs are Userset: SET them per session (or in postgresql.conf for
--- cluster-wide defaults).
+-- under the hood, so large result sets work transparently. Behavior matches
+-- vanilla Postgres: a query with LIMIT N returns at most N; a query without
+-- LIMIT returns every matching row. Use statement_timeout if you want to
+-- bound a long-running scan.
 
-CREATE EXTENSION IF NOT EXISTS beetle;
+CREATE EXTENSION IF NOT EXISTS tbw;
 
-CREATE SERVER IF NOT EXISTS tb_default FOREIGN DATA WRAPPER beetle;
+CREATE SERVER IF NOT EXISTS tb_default FOREIGN DATA WRAPPER tbw;
 
 -- Accounts. id, ledger, code are the primary filter axes:
 --   WHERE id = $1                     → OP_LOOKUP_ACCOUNT

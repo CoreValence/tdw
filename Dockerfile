@@ -2,10 +2,10 @@
 #
 # Two-stage build:
 #   1. `builder` compiles the pgrx extension against system-installed pg18 dev
-#      headers and drops beetle.so + control + sql into Debian's standard
+#      headers and drops tbw.so + control + sql into Debian's standard
 #      postgres install paths.
 #   2. `runtime` is stock postgres:18-bookworm with those three files copied in,
-#      so the extension is loadable via shared_preload_libraries=beetle.
+#      so the extension is loadable via shared_preload_libraries=tbw.
 
 FROM rust:1-bookworm AS builder
 
@@ -36,14 +36,14 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-${TARGETARCH} \
 RUN cargo pgrx init --pg18 "$PG_CONFIG"
 
 WORKDIR /build
-COPY Cargo.toml Cargo.lock beetle.control ./
+COPY Cargo.toml Cargo.lock tbw.control ./
 COPY .cargo ./.cargo
 COPY src ./src
 
 # On x86_64, Zig's libtb_client.a has initial-exec TLS relocations
 # (R_X86_64_TPOFF32) that cannot be linked into a -shared cdylib. Patch
 # the sys crate to link libtb_client.so dynamically and add $ORIGIN rpath
-# so the loader finds it next to beetle.so. aarch64 accepts the equivalent
+# so the loader finds it next to tbw.so. aarch64 accepts the equivalent
 # TLS relocations from the static archive and is unaffected.
 #
 # Everything runs in a single RUN so the sed patch, the $ORIGIN-linked
@@ -65,9 +65,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-${TARGETARCH} \
     fi; \
     RUSTFLAGS="$RUSTFLAGS" cargo pgrx install --release --pg-config "$PG_CONFIG"; \
     mkdir -p /export/lib /export/ext; \
-    cp /usr/lib/postgresql/18/lib/beetle.so /export/lib/; \
-    cp /usr/share/postgresql/18/extension/beetle.control /export/ext/; \
-    cp /usr/share/postgresql/18/extension/beetle--*.sql /export/ext/; \
+    cp /usr/lib/postgresql/18/lib/tbw.so /export/lib/; \
+    cp /usr/share/postgresql/18/extension/tbw.control /export/ext/; \
+    cp /usr/share/postgresql/18/extension/tbw--*.sql /export/ext/; \
     if [ "$(uname -m)" = "x86_64" ]; then \
         TB_SO=$(find target/release/build -name 'libtb_client.so' \
             -path '*x86_64-linux-gnu*' | head -1); \

@@ -20,14 +20,14 @@ use crate::shmem::{
 // handler AFTER the TB client is up and check this atomic directly.
 static GOT_SIGTERM: AtomicBool = AtomicBool::new(false);
 
-extern "C" fn beetle_sigterm_handler(_: libc::c_int) {
+extern "C" fn tbw_sigterm_handler(_: libc::c_int) {
     GOT_SIGTERM.store(true, Ordering::SeqCst);
 }
 
 unsafe fn install_sigterm_handler() {
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = beetle_sigterm_handler as *const () as usize;
+        sa.sa_sigaction = tbw_sigterm_handler as *const () as usize;
         libc::sigemptyset(&mut sa.sa_mask);
         sa.sa_flags = 0;
         libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
@@ -54,9 +54,9 @@ fn resolve_tb_addr(raw: &str) -> String {
             match e.to_socket_addrs() {
                 Ok(mut it) => match it.next() {
                     Some(sa) => sa.to_string(),
-                    None => error!("beetle: could not resolve {:?}: no addresses returned", e),
+                    None => error!("tbw: could not resolve {:?}: no addresses returned", e),
                 },
-                Err(err) => error!("beetle: could not resolve {:?}: {}", e, err),
+                Err(err) => error!("tbw: could not resolve {:?}: {}", e, err),
             }
         })
         .collect::<Vec<_>>()
@@ -136,7 +136,7 @@ enum BatchErr {
 
 #[pg_guard]
 #[unsafe(no_mangle)]
-pub extern "C-unwind" fn beetle_worker_main(_arg: pg_sys::Datum) {
+pub extern "C-unwind" fn tbw_worker_main(_arg: pg_sys::Datum) {
     unsafe {
         *WORKER_LATCH.exclusive() = pg_sys::MyLatch as usize;
     }
@@ -146,7 +146,7 @@ pub extern "C-unwind" fn beetle_worker_main(_arg: pg_sys::Datum) {
         .and_then(|s| s.into_string().ok())
         .unwrap_or_default();
     if tb_addr_raw.is_empty() {
-        error!("beetle: beetle.tb_addr must be set (e.g. 'host:port' or 'port')");
+        error!("tbw: tbw.tb_addr must be set (e.g. 'host:port' or 'port')");
     }
     let tb_addr = resolve_tb_addr(&tb_addr_raw);
 
@@ -156,13 +156,13 @@ pub extern "C-unwind" fn beetle_worker_main(_arg: pg_sys::Datum) {
         .unwrap_or_default();
     let cluster_id: u128 = cluster_id_raw.parse().unwrap_or_else(|e| {
         error!(
-            "beetle: invalid beetle.tb_cluster_id={:?}: {}",
+            "tbw: invalid tbw.tb_cluster_id={:?}: {}",
             cluster_id_raw, e
         )
     });
 
     log!(
-        "beetle: connecting to TigerBeetle at {} (resolved from {}) cluster {}",
+        "tbw: connecting to TigerBeetle at {} (resolved from {}) cluster {}",
         tb_addr,
         tb_addr_raw,
         cluster_id
@@ -171,11 +171,11 @@ pub extern "C-unwind" fn beetle_worker_main(_arg: pg_sys::Datum) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .expect("beetle: tokio rt");
+        .expect("tbw: tokio rt");
 
     let client = match tigerbeetle_unofficial::Client::new(cluster_id, tb_addr.as_bytes()) {
         Ok(c) => c,
-        Err(e) => error!("beetle: failed to connect to TigerBeetle: {}", e),
+        Err(e) => error!("tbw: failed to connect to TigerBeetle: {}", e),
     };
 
     // Install our own SIGTERM handler AFTER Client::new. pgrx's
@@ -185,11 +185,11 @@ pub extern "C-unwind" fn beetle_worker_main(_arg: pg_sys::Datum) {
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP);
     unsafe { install_sigterm_handler() };
 
-    log!("beetle: worker ready (capacity={})", CAPACITY);
+    log!("tbw: worker ready (capacity={})", CAPACITY);
 
     loop {
         if GOT_SIGTERM.load(Ordering::SeqCst) {
-            log!("beetle: sigterm observed");
+            log!("tbw: sigterm observed");
             break;
         }
         let _ = BackgroundWorker::sighup_received();
@@ -210,7 +210,7 @@ pub extern "C-unwind" fn beetle_worker_main(_arg: pg_sys::Datum) {
         BackgroundWorker::wait_latch(Some(Duration::from_millis(BATCH_WAIT_MS.get() as u64)));
     }
 
-    log!("beetle: worker exiting");
+    log!("tbw: worker exiting");
     // Force-exit: the TB client spawns a native Zig thread that survives
     // Rust's drop path and blocks the process from terminating, which made
     // postmaster shutdown hang past pg_ctl's timeout. OS cleans up on exit.

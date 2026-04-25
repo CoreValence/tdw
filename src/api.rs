@@ -95,7 +95,7 @@ fn submit_create_transfer(
             let rec = rb.record(0).expect("create_transfer returns one record");
             pgrx::Uuid::from_bytes(rec[..16].try_into().unwrap())
         }
-        Err(msg) => error!("beetle: {}", msg),
+        Err(msg) => error!("tbw: {}", msg),
     }
 }
 
@@ -191,7 +191,7 @@ fn submit_batch(packed: &[u8], count: u32) -> Vec<pgrx::Uuid> {
                 pgrx::Uuid::from_bytes(rec[..16].try_into().unwrap())
             })
             .collect(),
-        Err(msg) => error!("beetle: {}", msg),
+        Err(msg) => error!("tbw: {}", msg),
     }
 }
 
@@ -207,7 +207,7 @@ fn drain_balance(account: uuid::Uuid) -> u128 {
         Err(msg) if msg == "not found" => {
             error!("waterfall: source {account} not found");
         }
-        Err(msg) => error!("beetle: {}", msg),
+        Err(msg) => error!("tbw: {}", msg),
     };
     let rec = match rb.record(0) {
         Some(r) => r,
@@ -306,7 +306,7 @@ mod accounts {
                 let rec = rb.record(0).expect("accounts.open returns one record");
                 pgrx::Uuid::from_bytes(rec[..16].try_into().unwrap())
             }
-            Err(msg) => error!("beetle: {}", msg),
+            Err(msg) => error!("tbw: {}", msg),
         }
     }
 
@@ -337,7 +337,7 @@ mod accounts {
                 None => pgrx::iter::TableIterator::empty(),
             },
             Err(msg) if msg == "not found" => pgrx::iter::TableIterator::empty(),
-            Err(msg) => error!("beetle: {}", msg),
+            Err(msg) => error!("tbw: {}", msg),
         }
     }
 
@@ -371,7 +371,7 @@ mod accounts {
             slot.flags = flag_bits;
         }) {
             Ok(rb) => rb,
-            Err(msg) => error!("beetle: {}", msg),
+            Err(msg) => error!("tbw: {}", msg),
         };
         let rows: Vec<TransferRow> = (0..rb.count as usize)
             .filter_map(|i| rb.record(i).map(unpack_transfer_row))
@@ -406,7 +406,7 @@ mod accounts {
             slot.flags = flag_bits;
         }) {
             Ok(rb) => rb,
-            Err(msg) => error!("beetle: {}", msg),
+            Err(msg) => error!("tbw: {}", msg),
         };
         let rows: Vec<BalanceRow> = (0..rb.count as usize)
             .filter_map(|i| rb.record(i).map(unpack_balance_row))
@@ -444,7 +444,7 @@ mod accounts {
             slot.flags = flag_bits;
         }) {
             Ok(rb) => rb,
-            Err(msg) => error!("beetle: {}", msg),
+            Err(msg) => error!("tbw: {}", msg),
         };
         let rows: Vec<AccountRow> = (0..rb.count as usize)
             .filter_map(|i| rb.record(i).map(unpack_account_row))
@@ -913,7 +913,7 @@ mod transfers {
                 None => pgrx::iter::TableIterator::empty(),
             },
             Err(msg) if msg == "not found" => pgrx::iter::TableIterator::empty(),
-            Err(msg) => error!("beetle: {}", msg),
+            Err(msg) => error!("tbw: {}", msg),
         }
     }
 
@@ -946,7 +946,7 @@ mod transfers {
             slot.flags = flag_bits;
         }) {
             Ok(rb) => rb,
-            Err(msg) => error!("beetle: {}", msg),
+            Err(msg) => error!("tbw: {}", msg),
         };
         let rows: Vec<TransferRow> = (0..rb.count as usize)
             .filter_map(|i| rb.record(i).map(unpack_transfer_row))
@@ -971,7 +971,7 @@ mod transfers {
             Err(msg) if msg == "not found" => {
                 error!("transfers.reverse: original {original_id} not found")
             }
-            Err(msg) => error!("beetle: {}", msg),
+            Err(msg) => error!("tbw: {}", msg),
         };
         let rec = match rb.record(0) {
             Some(r) => r,

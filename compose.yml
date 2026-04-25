@@ -28,7 +28,7 @@ services:
     cap_add: [ IPC_LOCK ]
     security_opt: [ seccomp=unconfined ]
     networks:
-      beetle-net:
+      tbw-net:
         ipv4_address: 172.30.0.10
     volumes:
       - tigerbeetle-data:/data
@@ -44,7 +44,7 @@ services:
     cap_add: [ IPC_LOCK ]
     security_opt: [ seccomp=unconfined ]
     networks:
-      beetle-net:
+      tbw-net:
         ipv4_address: 172.30.0.11
     volumes:
       - tigerbeetle-data:/data
@@ -60,7 +60,7 @@ services:
     cap_add: [ IPC_LOCK ]
     security_opt: [ seccomp=unconfined ]
     networks:
-      beetle-net:
+      tbw-net:
         ipv4_address: 172.30.0.12
     volumes:
       - tigerbeetle-data:/data
@@ -83,24 +83,24 @@ services:
     security_opt:
       - seccomp=unconfined
     environment:
-      POSTGRES_DB: beetle
+      POSTGRES_DB: tbw
       POSTGRES_HOST_AUTH_METHOD: trust
     networks:
-      - beetle-net
+      - tbw-net
     command:
       - postgres
       - -c
-      - shared_preload_libraries=beetle
+      - shared_preload_libraries=tbw
       - -c
       - max_connections=1024
       - -c
-      - beetle.tb_addr=172.30.0.10:3000,172.30.0.11:3000,172.30.0.12:3000
+      - tbw.tb_addr=172.30.0.10:3000,172.30.0.11:3000,172.30.0.12:3000
       - -c
-      - beetle.tb_cluster_id=1
+      - tbw.tb_cluster_id=1
     ports:
       - "28819:5432"
     healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -U postgres -d beetle" ]
+      test: [ "CMD-SHELL", "pg_isready -U postgres -d tbw" ]
       interval: 1s
       timeout: 3s
       retries: 60
@@ -116,11 +116,11 @@ services:
       postgres:
         condition: service_healthy
     networks:
-      - beetle-net
+      - tbw-net
     environment:
       PGHOST: postgres
       PGPORT: "5432"
-      PGDATABASE: beetle
+      PGDATABASE: tbw
       PGUSER: postgres
       CLIENTS: "${CLIENTS:-1000}"
       DURATION: "${DURATION:-60}"
@@ -141,7 +141,7 @@ services:
                 -f /sql/bench_transfer.sql
 
 networks:
-  beetle-net:
+  tbw-net:
     driver: bridge
     ipam:
       config:
