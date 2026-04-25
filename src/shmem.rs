@@ -157,6 +157,6 @@ impl ResultPool {
 unsafe impl PGRXSharedMemory for Ring {}
 unsafe impl PGRXSharedMemory for ResultPool {}
 
-pub(crate) static RING: PgLwLock<Ring> = unsafe { PgLwLock::new(c"tbw_ring") };
-pub(crate) static RESULTS: PgLwLock<ResultPool> = unsafe { PgLwLock::new(c"tbw_results") };
-pub(crate) static WORKER_LATCH: PgLwLock<usize> = unsafe { PgLwLock::new(c"tbw_worker_latch") };
+pub(crate) static RING: PgLwLock<Ring> = unsafe { PgLwLock::new(c"tdw_ring") };
+pub(crate) static RESULTS: PgLwLock<ResultPool> = unsafe { PgLwLock::new(c"tdw_results") };
+pub(crate) static WORKER_LATCH: PgLwLock<usize> = unsafe { PgLwLock::new(c"tdw_worker_latch") };

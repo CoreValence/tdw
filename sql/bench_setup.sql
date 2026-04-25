@@ -7,7 +7,7 @@
 -- against a persistent tigerbeetle-data volume), the "Exists" error is
 -- swallowed per-account so the bench can proceed.
 
-CREATE EXTENSION IF NOT EXISTS tbw;
+CREATE EXTENSION IF NOT EXISTS tdw;
 
 DO $$
 DECLARE

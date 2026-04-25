@@ -20,14 +20,14 @@ use crate::shmem::{
 // handler AFTER the TB client is up and check this atomic directly.
 static GOT_SIGTERM: AtomicBool = AtomicBool::new(false);
 
-extern "C" fn tbw_sigterm_handler(_: libc::c_int) {
+extern "C" fn tdw_sigterm_handler(_: libc::c_int) {
     GOT_SIGTERM.store(true, Ordering::SeqCst);
 }
 
 unsafe fn install_sigterm_handler() {
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = tbw_sigterm_handler as *const () as usize;
+        sa.sa_sigaction = tdw_sigterm_handler as *const () as usize;
         libc::sigemptyset(&mut sa.sa_mask);
         sa.sa_flags = 0;
         libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
@@ -54,9 +54,9 @@ fn resolve_tb_addr(raw: &str) -> String {
             match e.to_socket_addrs() {
                 Ok(mut it) => match it.next() {
                     Some(sa) => sa.to_string(),
-                    None => error!("tbw: could not resolve {:?}: no addresses returned", e),
+                    None => error!("tdw: could not resolve {:?}: no addresses returned", e),
                 },
-                Err(err) => error!("tbw: could not resolve {:?}: {}", e, err),
+                Err(err) => error!("tdw: could not resolve {:?}: {}", e, err),
             }
         })
         .collect::<Vec<_>>()
@@ -136,7 +136,7 @@ enum BatchErr {
 
 #[pg_guard]
 #[unsafe(no_mangle)]
-pub extern "C-unwind" fn tbw_worker_main(_arg: pg_sys::Datum) {
+pub extern "C-unwind" fn tdw_worker_main(_arg: pg_sys::Datum) {
     unsafe {
         *WORKER_LATCH.exclusive() = pg_sys::MyLatch as usize;
     }
@@ -146,7 +146,7 @@ pub extern "C-unwind" fn tbw_worker_main(_arg: pg_sys::Datum) {
         .and_then(|s| s.into_string().ok())
         .unwrap_or_default();
     if tb_addr_raw.is_empty() {
-        error!("tbw: tbw.tb_addr must be set (e.g. 'host:port' or 'port')");
+        error!("tdw: tdw.tb_addr must be set (e.g. 'host:port' or 'port')");
     }
     let tb_addr = resolve_tb_addr(&tb_addr_raw);
 
@@ -156,10 +156,10 @@ pub extern "C-unwind" fn tbw_worker_main(_arg: pg_sys::Datum) {
         .unwrap_or_default();
     let cluster_id: u128 = cluster_id_raw
         .parse()
-        .unwrap_or_else(|e| error!("tbw: invalid tbw.tb_cluster_id={:?}: {}", cluster_id_raw, e));
+        .unwrap_or_else(|e| error!("tdw: invalid tdw.tb_cluster_id={:?}: {}", cluster_id_raw, e));
 
     log!(
-        "tbw: connecting to TigerBeetle at {} (resolved from {}) cluster {}",
+        "tdw: connecting to TigerBeetle at {} (resolved from {}) cluster {}",
         tb_addr,
         tb_addr_raw,
         cluster_id
@@ -168,11 +168,11 @@ pub extern "C-unwind" fn tbw_worker_main(_arg: pg_sys::Datum) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .expect("tbw: tokio rt");
+        .expect("tdw: tokio rt");
 
     let client = match tigerbeetle_unofficial::Client::new(cluster_id, tb_addr.as_bytes()) {
         Ok(c) => c,
-        Err(e) => error!("tbw: failed to connect to TigerBeetle: {}", e),
+        Err(e) => error!("tdw: failed to connect to TigerBeetle: {}", e),
     };
 
     // Install our own SIGTERM handler AFTER Client::new. pgrx's
@@ -182,7 +182,7 @@ pub extern "C-unwind" fn tbw_worker_main(_arg: pg_sys::Datum) {
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP);
     unsafe { install_sigterm_handler() };
 
-    log!("tbw: worker ready (capacity={})", CAPACITY);
+    log!("tdw: worker ready (capacity={})", CAPACITY);
 
     // If a previous worker died mid-flight, any S_IN_FLIGHT slots have no one
     // to publish their results. Mark them with a "worker restarted" error so
@@ -194,7 +194,7 @@ pub extern "C-unwind" fn tbw_worker_main(_arg: pg_sys::Datum) {
 
     loop {
         if GOT_SIGTERM.load(Ordering::SeqCst) {
-            log!("tbw: sigterm observed");
+            log!("tdw: sigterm observed");
             break;
         }
         let _ = BackgroundWorker::sighup_received();
@@ -226,7 +226,7 @@ pub extern "C-unwind" fn tbw_worker_main(_arg: pg_sys::Datum) {
         }
     }
 
-    log!("tbw: worker exiting");
+    log!("tdw: worker exiting");
     // Force-exit: the TB client spawns a native Zig thread that survives
     // Rust's drop path and blocks the process from terminating, which made
     // postmaster shutdown hang past pg_ctl's timeout. OS cleans up on exit.
@@ -242,7 +242,7 @@ pub extern "C-unwind" fn tbw_worker_main(_arg: pg_sys::Datum) {
 // who can decide whether to retry. The TB-side outcome is unknown (op may or
 // may not have committed); the error message says so.
 fn recover_after_restart() {
-    let msg = b"tbw: worker restarted mid-flight; outcome unknown, retry idempotent";
+    let msg = b"tdw: worker restarted mid-flight; outcome unknown, retry idempotent";
     let mut latches = Vec::new();
     {
         let mut guard = RING.exclusive();
@@ -261,7 +261,7 @@ fn recover_after_restart() {
     }
     if !latches.is_empty() {
         log!(
-            "tbw: recover_after_restart: marked {} stuck IN_FLIGHT slot(s) as ERROR",
+            "tdw: recover_after_restart: marked {} stuck IN_FLIGHT slot(s) as ERROR",
             latches.len()
         );
         for latch in latches {
@@ -319,7 +319,7 @@ fn reap_orphaned_slots() {
         }
     }
     if reaped > 0 {
-        log!("tbw: reap_orphaned_slots: reset {reaped} orphaned slot(s)");
+        log!("tdw: reap_orphaned_slots: reset {reaped} orphaned slot(s)");
     }
 }
 

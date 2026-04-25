@@ -24,7 +24,7 @@ services:
     cap_add: [ IPC_LOCK ]
     security_opt: [ seccomp=unconfined ]
     networks:
-      tbw-net:
+      tdw-net:
         ipv4_address: 172.30.0.10
     volumes:
       - tigerbeetle-data:/data
@@ -43,24 +43,24 @@ services:
     security_opt:
       - seccomp=unconfined
     environment:
-      POSTGRES_DB: tbw
+      POSTGRES_DB: tdw
       POSTGRES_HOST_AUTH_METHOD: trust
     networks:
-      - tbw-net
+      - tdw-net
     command:
       - postgres
       - -c
-      - shared_preload_libraries=tbw
+      - shared_preload_libraries=tdw
       - -c
       - max_connections=1024
       - -c
-      - tbw.tb_addr=172.30.0.10:3000
+      - tdw.tb_addr=172.30.0.10:3000
       - -c
-      - tbw.tb_cluster_id=1
+      - tdw.tb_cluster_id=1
     ports:
       - "28819:5432"
     healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -U postgres -d tbw" ]
+      test: [ "CMD-SHELL", "pg_isready -U postgres -d tdw" ]
       interval: 1s
       timeout: 3s
       retries: 60
@@ -76,11 +76,11 @@ services:
       postgres:
         condition: service_healthy
     networks:
-      - tbw-net
+      - tdw-net
     environment:
       PGHOST: postgres
       PGPORT: "5432"
-      PGDATABASE: tbw
+      PGDATABASE: tdw
       PGUSER: postgres
       CLIENTS: "${CLIENTS:-200}"
       DURATION: "${DURATION:-120}"
@@ -103,7 +103,7 @@ services:
                 -f /sql/bench_transfer.sql
 
 networks:
-  tbw-net:
+  tdw-net:
     driver: bridge
     ipam:
       config:

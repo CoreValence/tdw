@@ -1,10 +1,10 @@
 ![](./assets/banner.png)
 
-# tbw
+# tdw
 
 A SQL interface to [TigerBeetle](https://tigerbeetle.com/), packaged as a [PostgreSQL extension](https://www.postgresql.org/docs/current/extend-extensions.html).
 
-TigerBeetle is a great ledger and a terrible general-purpose database. Postgres is the opposite. `tbw` puts a thin SQL surface in front of TB so you can keep your accounts and transfers in TB while joining them against your own users, orders, and invoices in plain SQL. A single background worker inside Postgres batches every backend's requests into one TB client, so each connection pays for a shared-memory enqueue, not its own TCP socket.
+TigerBeetle is a great ledger and a terrible general-purpose database. Postgres is the opposite. `tdw` puts a thin SQL surface in front of TB so you can keep your accounts and transfers in TB while joining them against your own users, orders, and invoices in plain SQL. A single background worker inside Postgres batches every backend's requests into one TB client, so each connection pays for a shared-memory enqueue, not its own TCP socket.
 
 You write either:
 
@@ -13,59 +13,59 @@ SELECT transfers.post(gen_random_uuid(), alice, bob, 1000, 1, 10);
 SELECT * FROM tb_transfers WHERE debit_account_id = alice;
 ```
 
-and `tbw` routes both to TB.
+and `tdw` routes both to TB.
 
 ## Requirements
 
 - PostgreSQL 15, 16, 17, or 18
 - A running TigerBeetle cluster
-- `shared_preload_libraries = 'tbw'` in `postgresql.conf`
+- `shared_preload_libraries = 'tdw'` in `postgresql.conf`
 
 ## Quick start
 
-The bundled `compose.yml` runs a single-replica TB cluster, a Postgres 18 image with `tbw` preloaded, and a smoke/bench runner.
+The bundled `compose.yml` runs a single-replica TB cluster, a Postgres 18 image with `tdw` preloaded, and a smoke/bench runner.
 
-```sh
+```bash
 docker compose up -d postgres
-psql -h localhost -p 28819 -U postgres -d tbw -f sql/smoke.sql
+psql -h localhost -p 28819 -U postgres -d tdw -f sql/smoke.sql
 ```
 
 Run the bundled pgbench profile:
 
-```sh
+```bash
 CLIENTS=128 DURATION=60 docker compose run --rm bench
 ```
 
 ## Install (from release tarball)
 
-Tagged releases ship prebuilt bundles on the [Releases page](https://github.com/CoreValence/tbw/releases), one per Postgres major (15-18) and arch (amd64, arm64):
+Tagged releases ship prebuilt bundles on the [Releases page](https://github.com/CoreValence/tdw/releases), one per Postgres major (15-18) and arch (amd64, arm64):
 
 ```
-tbw-pg<major>-linux-<arch>.tar.gz
+tdw-pg<major>-linux-<arch>.tar.gz
 ```
 
 The tarball uses Debian's standard Postgres layout (`/usr/lib/postgresql/<major>/lib/` for `.so`, `/usr/share/postgresql/<major>/extension/` for `.control` and `.sql`). On Debian/Ubuntu with PGDG packages, extract from the filesystem root:
 
-```sh
-sudo tar xzf tbw-pg18-linux-amd64.tar.gz -C /
+```bash
+sudo tar xzf tdw-pg18-linux-amd64.tar.gz -C /
 ```
 
 For a non-Debian install, check `pg_config --pkglibdir` and `pg_config --sharedir` and move the extracted files into those directories.
 
-The amd64 bundle has two shared libraries: `tbw.so` and `libtb_client.so`. Keep them in the same directory; `tbw.so` resolves `libtb_client.so` via `$ORIGIN`. arm64 bundles only ship `tbw.so` (TigerBeetle's client links statically on that arch).
+The amd64 bundle has two shared libraries: `tdw.so` and `libtb_client.so`. Keep them in the same directory; `tdw.so` resolves `libtb_client.so` via `$ORIGIN`. arm64 bundles only ship `tdw.so` (TigerBeetle's client links statically on that arch).
 
 In `postgresql.conf`:
 
-```
-shared_preload_libraries = 'tbw'
-tbw.tb_addr              = '172.30.0.10:3000'   # comma-separate for multi-replica
-tbw.tb_cluster_id        = '1'
+```ini
+shared_preload_libraries = 'tdw'
+tdw.tb_addr              = '172.30.0.10:3000'   # comma-separate for multi-replica
+tdw.tb_cluster_id        = '1'
 ```
 
 Restart Postgres, then per database:
 
 ```sql
-CREATE EXTENSION tbw;
+CREATE EXTENSION tdw;
 ```
 
 ## Docker
@@ -74,26 +74,26 @@ Two-line image:
 
 ```dockerfile
 FROM postgres:18-bookworm
-ADD https://github.com/CoreValence/tbw/releases/download/v0.1.0/tbw-pg18-linux-amd64.tar.gz /tmp/tbw.tgz
-RUN tar xzf /tmp/tbw.tgz -C / && rm /tmp/tbw.tgz
+ADD https://github.com/CoreValence/tdw/releases/download/v0.1.0/tdw-pg18-linux-amd64.tar.gz /tmp/tdw.tgz
+RUN tar xzf /tmp/tdw.tgz -C / && rm /tmp/tdw.tgz
 ```
 
 Swap the Postgres major (`15`-`18`) and arch (`amd64`, `arm64`) in both the `FROM` and the tarball filename.
 
 Run against an existing TigerBeetle cluster:
 
-```sh
-docker build -t tbw:pg18 .
+```bash
+docker build -t tdw:pg18 .
 docker run --rm \
   --security-opt seccomp=unconfined \
   -e POSTGRES_HOST_AUTH_METHOD=trust \
-  -e POSTGRES_DB=tbw \
+  -e POSTGRES_DB=tdw \
   -p 5432:5432 \
-  tbw:pg18 \
+  tdw:pg18 \
   postgres \
-    -c shared_preload_libraries=tbw \
-    -c tbw.tb_addr=10.0.0.10:3000 \
-    -c tbw.tb_cluster_id=1
+    -c shared_preload_libraries=tdw \
+    -c tdw.tb_addr=10.0.0.10:3000 \
+    -c tdw.tb_cluster_id=1
 ```
 
 `seccomp=unconfined` is required because TigerBeetle's Zig client uses `io_uring` for TCP, and Docker's default seccomp profile blocks it.
@@ -106,17 +106,17 @@ Standard Postgres GUCs.
 
 | GUC                 | Context    | Default | Description                                                                                         |
 | ------------------- | ---------- | ------- | --------------------------------------------------------------------------------------------------- |
-| `tbw.tb_addr`       | Postmaster | `3000`  | Comma-separated TB replica addresses (`port`, `ip:port`, or `host:port`). Resolved at worker start. |
-| `tbw.tb_cluster_id` | Postmaster | `0`     | TigerBeetle cluster id (u128, decimal). Must match the value the replica was formatted with.        |
-| `tbw.batch_wait_ms` | Sighup     | `1`     | Worker idle wait between drains, ms. Lower means lower latency, higher means bigger batches.        |
-| `tbw.batch_max`     | Sighup     | `8189`  | Max slots drained per TB request. Capped by TB's 8189-per-message limit.                            |
+| `tdw.tb_addr`       | Postmaster | `3000`  | Comma-separated TB replica addresses (`port`, `ip:port`, or `host:port`). Resolved at worker start. |
+| `tdw.tb_cluster_id` | Postmaster | `0`     | TigerBeetle cluster id (u128, decimal). Must match the value the replica was formatted with.        |
+| `tdw.batch_wait_ms` | Sighup     | `1`     | Worker idle wait between drains, ms. Lower means lower latency, higher means bigger batches.        |
+| `tdw.batch_max`     | Sighup     | `8189`  | Max slots drained per TB request. Capped by TB's 8189-per-message limit.                            |
 
 ## Usage
 
 A round-trip: open two accounts, move money, read the balances back.
 
 ```sql
-CREATE EXTENSION tbw;
+CREATE EXTENSION tdw;
 
 DO $$
 DECLARE
@@ -231,7 +231,7 @@ transfers.reverse(id uuid, original_id uuid) → uuid
 
 ## FDW: TigerBeetle as SQL tables
 
-The functions above are the imperative path. For ad-hoc queries and joins against your own tables, `tbw` also exposes TB as three foreign tables. This is the part that makes "JOIN ledger against your existing schema in one query" actually work.
+The functions above are the imperative path. For ad-hoc queries and joins against your own tables, `tdw` also exposes TB as three foreign tables. This is the part that makes "JOIN ledger against your existing schema in one query" actually work.
 
 ```sql
 \i sql/fdw.sql  -- creates the server `tb_default` and three foreign tables
@@ -295,14 +295,14 @@ Each `accounts.*` or `transfers.*` call packs its request into a fixed-size slot
 
 Build against a specific Postgres major:
 
-```sh
+```bash
 cargo pgrx init --pg18 $(which pg_config)
 cargo pgrx run pg18
 ```
 
 Package an installable bundle:
 
-```sh
+```bash
 cargo pgrx package --features pg18 --pg-config $(which pg_config)
 ```
 

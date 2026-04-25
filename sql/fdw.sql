@@ -1,10 +1,10 @@
 -- Foreign data wrapper bindings for TigerBeetle.
 --
--- Run after `CREATE EXTENSION tbw`. The wrapper itself (`tbw`) is
+-- Run after `CREATE EXTENSION tdw`. The wrapper itself (`tdw`) is
 -- registered by the extension; this file creates a server and the three
 -- foreign tables mapped onto TB accounts, transfers, and balances.
 --
--- All routing goes through the same shmem ring the tbw.* functions use —
+-- All routing goes through the same shmem ring the tdw.* functions use —
 -- there's only one TB connection per cluster and the server is purely a Pg
 -- catalog requirement (no connection options need setting).
 --
@@ -14,9 +14,9 @@
 -- LIMIT returns every matching row. Use statement_timeout if you want to
 -- bound a long-running scan.
 
-CREATE EXTENSION IF NOT EXISTS tbw;
+CREATE EXTENSION IF NOT EXISTS tdw;
 
-CREATE SERVER IF NOT EXISTS tb_default FOREIGN DATA WRAPPER tbw;
+CREATE SERVER IF NOT EXISTS tb_default FOREIGN DATA WRAPPER tdw;
 
 -- Accounts. id, ledger, code are the primary filter axes:
 --   WHERE id = $1                     → OP_LOOKUP_ACCOUNT

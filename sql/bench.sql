@@ -10,12 +10,12 @@
     \set N 1000
 \endif
 
-CREATE EXTENSION IF NOT EXISTS tbw;
-SET tbw.bench_n = :'N';
+CREATE EXTENSION IF NOT EXISTS tdw;
+SET tdw.bench_n = :'N';
 
 DO $$
 DECLARE
-    n         int := current_setting('tbw.bench_n')::int;
+    n         int := current_setting('tdw.bench_n')::int;
     debit     uuid := gen_random_uuid();
     credit    uuid := gen_random_uuid();
     t0        timestamptz;

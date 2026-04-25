@@ -53,7 +53,7 @@ jobs:
       # (R_X86_64_TPOFF32 relocations), which cannot be linked into a -shared
       # cdylib on x86_64 by any Linux linker. Zig exposes no TLS model knob
       # for static libs, so we link the dynamic libtb_client.so instead and
-      # ship it alongside tbw.so with $ORIGIN rpath. aarch64 accepts the
+      # ship it alongside tdw.so with $ORIGIN rpath. aarch64 accepts the
       # equivalent TLS relocations from the static archive, so arm64 is
       # unaffected (tested: arm64 static link succeeds).
       - name: Patch sys crate to link dynamically (amd64)
@@ -71,7 +71,7 @@ jobs:
         env:
           PGRX_PG_CONFIG_PATH: /usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
           # $ORIGIN rpath lets the Postgres loader find libtb_client.so next to
-          # tbw.so (amd64 only; arm64 stays static). Harmless on arm64 but
+          # tdw.so (amd64 only; arm64 stays static). Harmless on arm64 but
           # scoped for clarity.
           RUSTFLAGS: ${{ matrix.arch == 'amd64' && '-C link-arg=-Wl,-rpath,$ORIGIN' || '' }}
         run: |
@@ -80,16 +80,16 @@ jobs:
             --features pg${{ matrix.pg }} \
             --pg-config /usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
 
-      - name: Stage libtb_client.so next to tbw.so (amd64)
+      - name: Stage libtb_client.so next to tdw.so (amd64)
         if: matrix.arch == 'amd64'
         run: |
           TB_SO=$(find target/release/build -name 'libtb_client.so' \
             -path '*x86_64-linux-gnu*' | head -1)
           test -n "$TB_SO"
           cp "$TB_SO" \
-            target/release/tbw-pg${{ matrix.pg }}/usr/lib/postgresql/${{ matrix.pg }}/lib/
+            target/release/tdw-pg${{ matrix.pg }}/usr/lib/postgresql/${{ matrix.pg }}/lib/
           ls -la \
-            target/release/tbw-pg${{ matrix.pg }}/usr/lib/postgresql/${{ matrix.pg }}/lib/
+            target/release/tdw-pg${{ matrix.pg }}/usr/lib/postgresql/${{ matrix.pg }}/lib/
 
       - name: Read version
         id: version
@@ -104,9 +104,9 @@ jobs:
           PG: ${{ matrix.pg }}
           ARCH: ${{ matrix.arch }}
         run: |
-          NAME="tbw-pg${PG}-linux-${ARCH}"
+          NAME="tdw-pg${PG}-linux-${ARCH}"
           mkdir -p dist
-          tar czf "dist/${NAME}.tar.gz" -C "target/release/tbw-pg${PG}" .
+          tar czf "dist/${NAME}.tar.gz" -C "target/release/tdw-pg${PG}" .
           (cd dist && sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256")
           echo "name=${NAME}" >> "$GITHUB_OUTPUT"
 

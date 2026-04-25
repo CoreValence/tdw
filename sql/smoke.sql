@@ -3,7 +3,7 @@
 --
 -- Idempotent: uses gen_random_uuid() so reruns never collide with TB state.
 
-CREATE EXTENSION IF NOT EXISTS tbw;
+CREATE EXTENSION IF NOT EXISTS tdw;
 
 DO $$
 DECLARE
