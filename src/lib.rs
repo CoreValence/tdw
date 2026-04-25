@@ -15,7 +15,12 @@ use shmem::{RESULTS, RING, ResultPool, Ring, WORKER_LATCH};
 
 ::pgrx::pg_module_magic!(name, version);
 
+// pgrx 0.18's pg_shmem_init! expands `#[cfg(feature = "pg13")]` / `pg14`
+// internally; we dropped those features so check-cfg flags them. The
+// allow is targeted (this fn only) rather than crate-wide so we still
+// catch typo'd cfgs anywhere else.
 #[pg_guard]
+#[allow(unexpected_cfgs)]
 pub extern "C-unwind" fn _PG_init() {
     guc::register();
 

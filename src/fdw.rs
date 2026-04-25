@@ -42,6 +42,118 @@ use crate::shmem::{
 };
 use crate::submit::{ReadBack, submit_and_wait, submit_and_wait_with_legs};
 
+// -----------------------------------------------------------------------------
+// Cross-version pg_sys shims
+// -----------------------------------------------------------------------------
+//
+// Two PG APIs we touch changed shape between supported majors:
+//   * TupleDescAttr was a macro before PG18 and a function in PG18. Older
+//     versions need direct field access into the TupleDescData FAM.
+//   * create_foreignscan_path picked up `fdw_restrictinfo` in PG17 and
+//     `disabled_nodes` in PG18, so it has 10 / 11 / 12 args depending on
+//     the build. The wrapper below accepts the PG18-shaped arg list and
+//     drops what the older bindings don't take.
+
+unsafe fn tuple_desc_attr(
+    tupdesc: pg_sys::TupleDesc,
+    i: i32,
+) -> *mut pg_sys::FormData_pg_attribute {
+    unsafe {
+        #[cfg(feature = "pg18")]
+        {
+            pg_sys::TupleDescAttr(tupdesc, i)
+        }
+        #[cfg(not(feature = "pg18"))]
+        {
+            // TupleDescData ends with a FAM `attrs[]` of FormData_pg_attribute.
+            // bindgen renders it as either a sized array or an
+            // __IncompleteArrayField; addr_of_mut works in both cases.
+            let base = std::ptr::addr_of_mut!((*tupdesc).attrs)
+                as *mut pg_sys::FormData_pg_attribute;
+            base.offset(i as isize)
+        }
+    }
+}
+
+// `Var.varno` is `Index` (u32) on PG15 and `int` (i32) on PG16+. The `as i32`
+// cast is meaningful on PG15 and a no-op on later versions; clippy fires on
+// the latter. Centralize the conversion so the allow only sits in one place.
+unsafe fn varno_member(var: *mut pg_sys::Var, relids: *mut pg_sys::Bitmapset) -> bool {
+    #[allow(clippy::unnecessary_cast)]
+    let varno = unsafe { (*var).varno } as i32;
+    unsafe { pg_sys::bms_is_member(varno, relids) }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn create_foreignscan_path_compat(
+    root: *mut pg_sys::PlannerInfo,
+    rel: *mut pg_sys::RelOptInfo,
+    target: *mut pg_sys::PathTarget,
+    rows: f64,
+    startup_cost: f64,
+    total_cost: f64,
+    pathkeys: *mut pg_sys::List,
+    required_outer: *mut pg_sys::Bitmapset,
+    fdw_outerpath: *mut pg_sys::Path,
+    fdw_restrictinfo: *mut pg_sys::List,
+    fdw_private: *mut pg_sys::List,
+) -> *mut pg_sys::ForeignPath {
+    unsafe {
+        #[cfg(feature = "pg18")]
+        {
+            pg_sys::create_foreignscan_path(
+                root,
+                rel,
+                target,
+                rows,
+                0, // disabled_nodes
+                startup_cost,
+                total_cost,
+                pathkeys,
+                required_outer,
+                fdw_outerpath,
+                fdw_restrictinfo,
+                fdw_private,
+            )
+        }
+        #[cfg(feature = "pg17")]
+        {
+            pg_sys::create_foreignscan_path(
+                root,
+                rel,
+                target,
+                rows,
+                startup_cost,
+                total_cost,
+                pathkeys,
+                required_outer,
+                fdw_outerpath,
+                fdw_restrictinfo,
+                fdw_private,
+            )
+        }
+        #[cfg(any(feature = "pg15", feature = "pg16"))]
+        {
+            // fdw_restrictinfo doesn't exist on PG <17; the join clauses we'd
+            // pass via it are still in baserel->joininfo and get re-evaluated
+            // by the executor, so dropping it here is safe (just less optimal).
+            let _ = fdw_restrictinfo;
+            pg_sys::create_foreignscan_path(
+                root,
+                rel,
+                target,
+                rows,
+                startup_cost,
+                total_cost,
+                pathkeys,
+                required_outer,
+                fdw_outerpath,
+                fdw_private,
+            )
+        }
+    }
+}
+
 // Which TB entity this foreign table is bound to. Decided at planning time by
 // matching the relation's relname against the fixed set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -126,7 +238,7 @@ unsafe fn validate_schema(rel: pg_sys::Relation, kind: TableKind) {
             );
         }
         for (i, (want_name, want_oid)) in expected.iter().enumerate() {
-            let attr = pg_sys::TupleDescAttr(tupdesc, i as i32);
+            let attr = tuple_desc_attr(tupdesc, i as i32);
             if (*attr).attisdropped {
                 pg_sys::error!(
                     "tbw_fdw: column {} of {:?} is dropped; expected {}",
@@ -490,12 +602,11 @@ unsafe extern "C-unwind" fn get_foreign_paths(
         // Unparameterized path. No sort keys (TB returns in its own ordering).
         let startup_cost = 100.0;
         let total_cost = startup_cost + 10.0 * (*baserel).rows;
-        let path = pg_sys::create_foreignscan_path(
+        let path = create_foreignscan_path_compat(
             root,
             baserel,
             std::ptr::null_mut(),
             (*baserel).rows,
-            0,
             startup_cost,
             total_cost,
             std::ptr::null_mut(),
@@ -599,12 +710,11 @@ unsafe fn add_parameterized_paths(
             };
             let startup_cost = 100.0;
             let total_cost = startup_cost + 10.0 * rows;
-            let path = pg_sys::create_foreignscan_path(
+            let path = create_foreignscan_path_compat(
                 root,
                 baserel,
                 std::ptr::null_mut(),
                 rows,
-                0,
                 startup_cost,
                 total_cost,
                 std::ptr::null_mut(),
@@ -641,7 +751,7 @@ unsafe extern "C-unwind" fn ec_match_attno(
             return false;
         }
         let v = expr as *mut pg_sys::Var;
-        if !pg_sys::bms_is_member((*v).varno as i32, (*rel).relids) {
+        if !varno_member(v, (*rel).relids) {
             return false;
         }
         (*v).varattno == ctx.attno
@@ -788,7 +898,7 @@ unsafe fn try_push_clause(
                 return None;
             }
             let v = n as *mut pg_sys::Var;
-            if pg_sys::bms_is_member((*v).varno as i32, relids) {
+            if varno_member(v, relids) {
                 Some(v)
             } else {
                 None
@@ -830,7 +940,7 @@ unsafe fn try_push_clause(
         // exactly like a prepared-statement Param.
         if node_is_var(other) {
             let v = other as *mut pg_sys::Var;
-            if pg_sys::bms_is_member((*v).varno as i32, relids) {
+            if varno_member(v, relids) {
                 // Self-Var on our rel — not a pushable join driver.
                 return false;
             }
@@ -908,19 +1018,19 @@ unsafe fn assign_const(
                 }
             }
             (QualField::Code, PgType::Int4) => {
-                if let Some(v) = int4_from_const(cst) {
-                    if (0..=u16::MAX as i32).contains(&v) {
-                        out.code = Some(v as u16);
-                        return true;
-                    }
+                if let Some(v) = int4_from_const(cst)
+                    && (0..=u16::MAX as i32).contains(&v)
+                {
+                    out.code = Some(v as u16);
+                    return true;
                 }
             }
             (QualField::Flags, PgType::Int4) => {
-                if let Some(v) = int4_from_const(cst) {
-                    if v >= 0 {
-                        out.flags = Some(v as u32);
-                        return true;
-                    }
+                if let Some(v) = int4_from_const(cst)
+                    && v >= 0
+                {
+                    out.flags = Some(v as u32);
+                    return true;
                 }
             }
             _ => {}
@@ -1770,7 +1880,7 @@ unsafe extern "C-unwind" fn begin_foreign_modify(
             TableKind::Transfers => {
                 let mut m = TransferInsertAttnums::default();
                 for i in 0..natts {
-                    let attr = pg_sys::TupleDescAttr(tupdesc, i);
+                    let attr = tuple_desc_attr(tupdesc, i);
                     let name = CStr::from_ptr((*attr).attname.data.as_ptr()).to_string_lossy();
                     let a = (i + 1) as c_int;
                     match name.as_ref() {
@@ -1790,7 +1900,7 @@ unsafe extern "C-unwind" fn begin_foreign_modify(
             TableKind::Accounts => {
                 let mut m = AccountInsertAttnums::default();
                 for i in 0..natts {
-                    let attr = pg_sys::TupleDescAttr(tupdesc, i);
+                    let attr = tuple_desc_attr(tupdesc, i);
                     let name = CStr::from_ptr((*attr).attname.data.as_ptr()).to_string_lossy();
                     let a = (i + 1) as c_int;
                     match name.as_ref() {
